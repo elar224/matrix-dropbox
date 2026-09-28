@@ -10,6 +10,7 @@ class MtrxBot:
     mtrx_url: str
     user_pass: str
     mtrx_room_id: str
+    mtrx_room_id_priv: str
     mtrx_user_id: str
     mtrx_dev_id: str
 
@@ -53,6 +54,7 @@ def load_config(path: str | None=None) -> Config:
                     user_pass=os.getenv('USER_PASS'),
                     mtrx_user_id=os.getenv('MATRIX_USER_ID'),
                     mtrx_room_id=os.getenv('ROOM_ID'),
+                    mtrx_room_id_priv=os.getenv('ROOM_ID_PRIV'),
                     mtrx_dev_id=os.getenv("MATRIX_DEVICE_ID")
                 ),
                 logging=LoggingConfig(
@@ -82,7 +84,7 @@ ALLOWED_MIMETYPES = ALLOWED_DOCUMENT_MIMETYPES + ALLOWED_IMAGE_MIMETYPES
 
 # Список папок: ключ — цифра ответа, значение — путь
 TARGET_FOLDERS = {
-    "1": "/path/to/server/documents/invoices",
-    "2": "/path/to/server/documents/contracts",
-    "3": "/path/to/server/documents/reports",
+    "1": "/home/mkuznetcova/PycharmProjects/Matrix echo bot /matrix_downloads/1022",
+    "2": "/home/mkuznetcova/PycharmProjects/Matrix echo bot /matrix_downloads/1088",
+    "3": "/home/mkuznetcova/PycharmProjects/Matrix echo bot /matrix_downloads/Все подряд",
 }

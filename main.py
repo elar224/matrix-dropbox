@@ -82,7 +82,7 @@ class StateManager:
         return f"{REDIS_PREFIX}:{room_id}:{user_id}"
 
     async def set_pending(
-            self, room_id: str, user_id: str, temp_path: str, filename: str, mxc_url: str, is_image: bool
+            self, room_id: str, user_id: str, temp_path: str, filename: str
     ) -> None:
         data = {
             "temp_path": temp_path,
@@ -92,10 +92,10 @@ class StateManager:
         await self.redis.set(
             self._key(room_id, user_id),
             json.dumps(data),
+
             ex=STATE_TTL_SECONDS,
         )
         logger.debug(f"Состояние сохранено: room={room_id}, user={user_id}, file={filename}")
-
     async def get_pending(self, room_id: str, user_id: str) -> dict | None:
         raw = await self.redis.get(self._key(room_id, user_id))
         if raw is None:
@@ -128,10 +128,17 @@ async def send_message(room_id: str, text: str):
 
 
 def is_allowed_room(room_id: str) -> bool:
-    ####Проверяет, разрешено ли боту работать в этой комнате
-    allowed_rooms = [config.mtrx_bot.mtrx_room_id]
-    return room_id in allowed_rooms
+    """Проверяет, разрешено ли боту работать в этой комнате"""
+    # Фильтруем пустые значения, если вдруг что-то не задано в .env
+    allowed_rooms = [
+        rid for rid in [config.mtrx_bot.mtrx_room_id, config.mtrx_bot.mtrx_room_id_priv]
+        if rid
+    ]
 
+    is_allowed = room_id in allowed_rooms
+    if not is_allowed:
+        logger.warning(f"⛔ Комната {room_id} НЕ в списке разрешенных: {allowed_rooms}")
+    return is_allowed
 
 
 def build_menu_text(filename: str) -> str:
@@ -142,14 +149,24 @@ def build_menu_text(filename: str) -> str:
     text += "\nИли отправьте `/cancel` для отмены."
     return text
 
+
 async def handle_file_event(room: MatrixRoom, event):
-    #######Общий обработчик входящих файлов и изображений
+    """Общий обработчик входящих файлов и изображений"""
+    # 🔥 ЛОГ №1: Мы вообще получили это событие?
+    logger.info(f"📥 ПОЛУЧЕНО СОБЫТИЕ ФАЙЛА! Room: {room.room_id}, Sender: {event.sender}, Type: {type(event).__name__}")
+
+    if not is_allowed_room(room.room_id):
+        return  # Лог уже выведется внутри is_allowed_room
+
     content = event.source.get("content", {})
     mimetype = content.get("info", {}).get("mimetype", "")
 
+    # 🔥 ЛОГ №2: Какой MIME-тип видит бот?
+    logger.info(f"🔍 Проверка MIME-типа: '{mimetype}'")
+
     if mimetype not in ALLOWED_MIMETYPES:
-        logger.info(f"Файл отклонён (неподдерживаемый тип): {mimetype}")
-        await send_message(room.room_id, f"Формат `{mimetype}` не поддерживается.")
+        logger.warning(f"Файл отклонён (неподдерживаемый тип): {mimetype}. Разрешенные: {ALLOWED_MIMETYPES}")
+        await send_message(room.room_id, f"⚠️ Формат `{mimetype}` не поддерживается.")
         return
 
     filename = content.get("body", "unknown_file")
@@ -158,8 +175,7 @@ async def handle_file_event(room: MatrixRoom, event):
         logger.warning("Файл без URL, пропускаю")
         return
 
-    logger.info(f"Получен файл: {filename} ({mimetype}) от {event.sender}")
-
+    logger.info(f"✅ Файл принят в работу: {filename} от {event.sender}")
     # Проверяем, нет ли у пользователя уже активного состояния
     existing = await state.get_pending(room.room_id, event.sender)
     if existing:
@@ -177,7 +193,7 @@ async def handle_file_event(room: MatrixRoom, event):
 
     # Скачиваем файл
     try:
-        response = await client.download_media(mxc_url)
+        response = await client.download(mxc_url)
     except Exception as e:
         logger.error(f"Ошибка скачивания {mxc_url}: {e}")
         await send_message(room.room_id, "Ошибка при скачивании файла с сервера.")
