@@ -84,7 +84,7 @@ ALLOWED_MIMETYPES = ALLOWED_DOCUMENT_MIMETYPES + ALLOWED_IMAGE_MIMETYPES
 
 # Список папок: ключ — цифра ответа, значение — путь
 TARGET_FOLDERS = {
-    "1": "/home/mkuznetcova/PycharmProjects/Matrix echo bot /matrix_downloads/1022",
-    "2": "/home/mkuznetcova/PycharmProjects/Matrix echo bot /matrix_downloads/1088",
-    "3": "/home/mkuznetcova/PycharmProjects/Matrix echo bot /matrix_downloads/Все подряд",
+    "1": "/home/mkuznetcova/PycharmProjects/Matrix dropbox/matrix_downloads/1022",
+    "2": "/home/mkuznetcova/PycharmProjects/Matrix dropbox/matrix_downloads/1088",
+    "3": "/home/mkuznetcova/PycharmProjects/Matrix dropbox/matrix_downloads/Все подряд",
 }

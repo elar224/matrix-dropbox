@@ -1,34 +1,26 @@
 import asyncio
 import json
+import logging
+import logging.handlers
 import os
 import shutil
 import time
-import logging
-from logging.handlers import RotatingFileHandler
 from datetime import datetime
 import nio
-from nio import (
-    AsyncClient,
-    MatrixRoom,
-    RoomMessageText,
-    RoomMessageFile,
-    RoomMessageImage)
+from nio import (AsyncClient, MatrixRoom, RoomMessageText, RoomMessageFile, RoomMessageImage)
 import redis.asyncio as redis
 from config import load_config, ALLOWED_MIMETYPES, TARGET_FOLDERS
 
-
-#######################################################
+##################################
 config = load_config()
-
-DOWNLOAD_DIR = "/tmp/matrix_downloads"
-STATE_TTL_SECONDS = 3600  # 1 час
-
-# Redis-ключи
+DOWNLOAD_DIR = "/app/tmp/matrix_downloads"
+STATE_TTL_SECONDS = 3600
 REDIS_PREFIX = "pending"
 
-################Logging
+#########################
+#Логирование
 def setup_logging() -> logging.Logger:
-    #########Настраивает логирование: консоль + файл с ротацией
+    ###Настраивает логирование: консоль + файл с ротацией
     logger = logging.getLogger("matrix_bot")
     logger.setLevel(getattr(logging, config.logging.level, logging.INFO))
 
@@ -44,7 +36,7 @@ def setup_logging() -> logging.Logger:
 
     # Файловый обработчик с ротацией
     try:
-        file_handler = RotatingFileHandler(
+        file_handler = logging.handlers.RotatingFileHandler(
             config.logging.log_file,
             maxBytes=config.logging.max_bytes,
             backupCount=config.logging.backup_count,
@@ -55,19 +47,20 @@ def setup_logging() -> logging.Logger:
     except OSError as e:
         logger.warning(f"Не удалось создать файл логов: {e}")
 
-    # Уменьшаем шум от matrix-nio и httpx
+    # Шум от matrix-nio и httpx
     logging.getLogger("nio").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     return logger
 
-
 logger = setup_logging()
 
-class StateManager:
-    ############## FSM на Redis
 
+##############################
+# FSM Redis
+
+class StateManager:
     def __init__(self):
         redis_url = f"redis://{config.db.host}:{config.db.port}"
         if config.db.password:
@@ -92,10 +85,10 @@ class StateManager:
         await self.redis.set(
             self._key(room_id, user_id),
             json.dumps(data),
-
             ex=STATE_TTL_SECONDS,
         )
         logger.debug(f"Состояние сохранено: room={room_id}, user={user_id}, file={filename}")
+
     async def get_pending(self, room_id: str, user_id: str) -> dict | None:
         raw = await self.redis.get(self._key(room_id, user_id))
         if raw is None:
@@ -112,7 +105,9 @@ class StateManager:
                 yield key, json.loads(raw)
 
 
-############# Инициализация клиента Matrix
+#############################################
+##### Клиент Matrix и вспомогательные функции
+
 client = AsyncClient(config.mtrx_bot.mtrx_url)
 state = StateManager()
 
@@ -128,45 +123,47 @@ async def send_message(room_id: str, text: str):
 
 
 def is_allowed_room(room_id: str) -> bool:
-    """Проверяет, разрешено ли боту работать в этой комнате"""
-    # Фильтруем пустые значения, если вдруг что-то не задано в .env
+    ###Разрешенные комнаты
     allowed_rooms = [
         rid for rid in [config.mtrx_bot.mtrx_room_id, config.mtrx_bot.mtrx_room_id_priv]
         if rid
     ]
-
     is_allowed = room_id in allowed_rooms
     if not is_allowed:
-        logger.warning(f"⛔ Комната {room_id} НЕ в списке разрешенных: {allowed_rooms}")
+        logger.warning(f"Комната {room_id} не в списке разрешенных: {allowed_rooms}")
     return is_allowed
 
 
 def build_menu_text(filename: str) -> str:
-    text = f"Получен файл: **{filename}**\n\nКуда его сохранить? Ответьте цифрой:\n"
+    text = f"Получен файл: {filename}\n\nКуда его сохранить? Ответьте цифрой:\n"
     for key, folder_path in TARGET_FOLDERS.items():
         folder_name = os.path.basename(folder_path)
         text += f"{key}. {folder_name}\n"
-    text += "\nИли отправьте `/cancel` для отмены."
+    text += "\nИли отправьте /cancel для отмены."
     return text
 
 
+#################################################
+#####Хэндлеры
+
 async def handle_file_event(room: MatrixRoom, event):
-    """Общий обработчик входящих файлов и изображений"""
-    # 🔥 ЛОГ №1: Мы вообще получили это событие?
-    logger.info(f"📥 ПОЛУЧЕНО СОБЫТИЕ ФАЙЛА! Room: {room.room_id}, Sender: {event.sender}, Type: {type(event).__name__}")
+    ###Общий обработчик входящих файлов и изображений
+    logger.info(
+        f"Получено событие файла: room={room.room_id}, "
+        f"sender={event.sender}, type={type(event).__name__}"
+    )
 
     if not is_allowed_room(room.room_id):
-        return  # Лог уже выведется внутри is_allowed_room
+        return
 
     content = event.source.get("content", {})
     mimetype = content.get("info", {}).get("mimetype", "")
 
-    # 🔥 ЛОГ №2: Какой MIME-тип видит бот?
-    logger.info(f"🔍 Проверка MIME-типа: '{mimetype}'")
+    logger.info(f"Проверка MIME-типа: '{mimetype}'")
 
     if mimetype not in ALLOWED_MIMETYPES:
-        logger.warning(f"Файл отклонён (неподдерживаемый тип): {mimetype}. Разрешенные: {ALLOWED_MIMETYPES}")
-        await send_message(room.room_id, f"⚠️ Формат `{mimetype}` не поддерживается.")
+        logger.warning(f"Файл отклонён (неподдерживаемый тип): {mimetype}")
+        await send_message(room.room_id, f"Формат {mimetype} не поддерживается.")
         return
 
     filename = content.get("body", "unknown_file")
@@ -175,7 +172,8 @@ async def handle_file_event(room: MatrixRoom, event):
         logger.warning("Файл без URL, пропускаю")
         return
 
-    logger.info(f"✅ Файл принят в работу: {filename} от {event.sender}")
+    logger.info(f"Файл принят в работу: {filename} от {event.sender}")
+
     # Проверяем, нет ли у пользователя уже активного состояния
     existing = await state.get_pending(room.room_id, event.sender)
     if existing:
@@ -220,8 +218,9 @@ async def handle_file_event(room: MatrixRoom, event):
     await state.set_pending(room.room_id, event.sender, temp_path, filename)
     await send_message(room.room_id, build_menu_text(filename))
 
+
 async def on_room_message(room: MatrixRoom, event):
-    #######Обработчик текстовых сообщений
+    ####Обработчик текстовых сообщений
     if event.sender == client.user_id:
         return
 
@@ -257,7 +256,7 @@ async def on_room_message(room: MatrixRoom, event):
     if choice not in TARGET_FOLDERS:
         await send_message(
             room.room_id,
-            "Неверный выбор. Пожалуйста, ответьте цифрой из списка или отправьте `/cancel`.",
+            "Неверный выбор. Пожалуйста, ответьте цифрой из списка или отправьте /cancel.",
         )
         return
 
@@ -279,19 +278,21 @@ async def on_room_message(room: MatrixRoom, event):
         logger.info(f"Файл перемещён: {src_path} -> {dst_path}")
         await send_message(
             room.room_id,
-            f"✅ Файл сохранён в папку `{os.path.basename(dst_dir)}`:\n`{dst_path}`",
+            f"Файл сохранён в папку {os.path.basename(dst_dir)}:\n{dst_path}",
         )
     except OSError as e:
         logger.error(f"Ошибка перемещения файла: {e}")
-        await send_message(room.room_id, f"❌ Ошибка при сохранении: {e}")
+        await send_message(room.room_id, f"Ошибка при сохранении: {e}")
         return
 
     await state.delete_pending(room.room_id, event.sender)
 
 
+################################################
+#### Jчистка orphan-файлов
 
 async def orphan_cleanup_loop():
-    ########Фоновая задача для очистки orphan-файлов
+    ###оновая задача для очистки файлов, оставшихся без состояния в Redis
     while True:
         try:
             await asyncio.sleep(600)
@@ -315,6 +316,9 @@ async def orphan_cleanup_loop():
             logger.error(f"[cleanup] ошибка: {e}", exc_info=True)
 
 
+#############################
+###Точка входа
+
 async def main():
     # Авторизация
     if config.mtrx_bot.mtrx_token:
@@ -335,9 +339,7 @@ async def main():
         try:
             login_resp = await client.login(
                 config.mtrx_bot.mtrx_user_id,
-                config.mtrx_bot.user_pass,
-                device_name="FileBot",
-                device_id=config.mtrx_bot.mtrx_dev_id or None,
+                config.mtrx_bot.user_pass
             )
             if isinstance(login_resp, nio.LoginError):
                 logger.error(f"Ошибка входа: {login_resp.message}")
@@ -347,11 +349,10 @@ async def main():
             logger.error(f"Ошибка логина: {e}")
             return
 
-
+    # Регистрация callback'ов
     client.add_event_callback(on_room_message, RoomMessageText)
     client.add_event_callback(handle_file_event, RoomMessageFile)
     client.add_event_callback(handle_file_event, RoomMessageImage)
-
 
     logger.info("Callback'и зарегистрированы. Запускаю sync_forever...")
 
@@ -372,6 +373,7 @@ async def main():
         await state.close()
         await client.close()
         logger.info("Бот остановлен, ресурсы освобождены")
+
 
 if __name__ == "__main__":
     try:
