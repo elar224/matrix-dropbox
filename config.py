@@ -1,6 +1,7 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from dotenv import load_dotenv
+import json
 
 load_dotenv()
 
@@ -13,6 +14,7 @@ class MtrxBot:
     mtrx_room_id_priv: str
     mtrx_user_id: str
     mtrx_dev_id: str
+    admin_users: list[str] = field(default_factory=list)
 
 @dataclass
 class RedisConfig:
@@ -27,12 +29,22 @@ class LoggingConfig:
     max_bytes: int
     backup_count: int
 
+@dataclass
+class SFTPConfig:
+    enabled: bool
+    host: str
+    port: int
+    user: str
+    password: str
+    known_hosts: str
 
 @dataclass
 class Config:
     db: RedisConfig
     mtrx_bot: MtrxBot
     logging: LoggingConfig
+    sftp: SFTPConfig
+    folders_file: str
 
 
 # Создаем экземпляр класса Config и наполняем его данными из переменных окружения
@@ -42,6 +54,9 @@ def load_config(path: str | None=None) -> Config:
         load_dotenv(path)
     else:
         load_dotenv()
+    folders_file = os.getenv("FOLDERS_FILE", "/app/config/folders.json")
+    admin_users_raw = os.getenv("ADMIN_USERS", "")
+    admin_users = [u.strip() for u in admin_users_raw.split(",") if u.strip()]
     return Config(
                 db=RedisConfig(
                 host=os.getenv("DB_HOST", ""),
@@ -55,14 +70,24 @@ def load_config(path: str | None=None) -> Config:
                     mtrx_user_id=os.getenv('MATRIX_USER_ID'),
                     mtrx_room_id=os.getenv('ROOM_ID'),
                     mtrx_room_id_priv=os.getenv('ROOM_ID_PRIV'),
-                    mtrx_dev_id=os.getenv("MATRIX_DEVICE_ID")
+                    mtrx_dev_id=os.getenv("MATRIX_DEVICE_ID"),
+                    admin_users=admin_users,
+                ),
+                sftp=SFTPConfig(
+                    enabled=os.getenv("SFTP_ENABLED", "false").lower() in ("true", "1", "yes"),
+                    host=os.getenv("SFTP_HOST", ""),
+                    port=int(os.getenv("SFTP_PORT", "22")),
+                    user=os.getenv("SFTP_USER", ""),
+                    password=os.getenv("SFTP_PASSWORD", ""),
+                    known_hosts=os.getenv("SFTP_KNOWN_HOSTS", "none"),
                 ),
                 logging=LoggingConfig(
                 level=os.getenv("LOG_LEVEL", "INFO").upper(),
                 log_file=os.getenv("LOG_FILE", "bot.log"),
                 max_bytes=int(os.getenv("LOG_MAX_BYTES", str(10 * 1024 * 1024))),  # 10 MB
                 backup_count=int(os.getenv("LOG_BACKUP_COUNT", "5"))
-                    ))
+                    ),
+                folders_file=folders_file)
 ############################################################################################
 ALLOWED_DOCUMENT_MIMETYPES = [
     "application/pdf",
@@ -82,9 +107,26 @@ ALLOWED_IMAGE_MIMETYPES = [
 ]
 ALLOWED_MIMETYPES = ALLOWED_DOCUMENT_MIMETYPES + ALLOWED_IMAGE_MIMETYPES
 
-# Список папок: ключ — цифра ответа, значение — путь
-TARGET_FOLDERS = {
-    "1": "/home/mkuznetcova/PycharmProjects/Matrix dropbox/matrix_downloads/1022",
-    "2": "/home/mkuznetcova/PycharmProjects/Matrix dropbox/matrix_downloads/1088",
-    "3": "/home/mkuznetcova/PycharmProjects/Matrix dropbox/matrix_downloads/Все подряд",
-}
+def load_folders(folders_file: str) -> dict[str, str]:
+
+    if not os.path.exists(folders_file):
+        return {}
+    try:
+        with open(folders_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        # Валидация
+        result = {}
+        for key, value in data.items():
+            if not isinstance(key, str) or not isinstance(value, str):
+                continue
+            result[key] = value
+        return result
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"Ошибка загрузки folders.json: {e}")
+        return {}
+
+
+def save_folders(folders_file: str, folders: dict[str, str]) -> None:
+    os.makedirs(os.path.dirname(folders_file) or ".", exist_ok=True)
+    with open(folders_file, "w", encoding="utf-8") as f:
+        json.dump(folders, f, indent=2, ensure_ascii=False)
