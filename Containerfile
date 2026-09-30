@@ -19,7 +19,7 @@ USER botuser
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    LOG_FILE=/app/logs/bot.log
+    LOG_FILE=/app/logs/bot.log \
     FOLDERS_FILE=/app/config/folders.json
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \

@@ -348,8 +348,15 @@ async def handle_file_event(room: MatrixRoom, event):
         logger.debug(f"Игнорирую старое событие файла от {event.sender}")
         return
 
-    # ДОБАВЛЕНО: Игнорируем сообщения самого бота
+    # Игнорируем сообщения самого бота
     if event.sender == client.user_id:
+        return
+
+    # Если пользователь ожидает файл со списком папок — пропускаем,
+    # его обработает handle_folders_file
+    pending = await state.get_pending(room.room_id, event.sender)
+    if pending and pending.get("state") == "awaiting_folders":
+        logger.debug(f"Файл от {event.sender} пропущен (состояние awaiting_folders)")
         return
 
     logger.info(
