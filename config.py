@@ -30,20 +30,20 @@ class LoggingConfig:
     backup_count: int
 
 @dataclass
-class SFTPConfig:
+class SMBConfig:
     enabled: bool
-    host: str
-    port: int
-    user: str
+    server_ip: str
+    username: str
     password: str
-    known_hosts: str
+    share_name: str
+    port: int = 445
 
 @dataclass
 class Config:
     db: RedisConfig
     mtrx_bot: MtrxBot
     logging: LoggingConfig
-    sftp: SFTPConfig
+    smb: SMBConfig
     folders_file: str
 
 
@@ -73,21 +73,21 @@ def load_config(path: str | None=None) -> Config:
                     mtrx_dev_id=os.getenv("MATRIX_DEVICE_ID"),
                     admin_users=admin_users,
                 ),
-                sftp=SFTPConfig(
-                    enabled=os.getenv("SFTP_ENABLED", "false").lower() in ("true", "1", "yes"),
-                    host=os.getenv("SFTP_HOST", ""),
-                    port=int(os.getenv("SFTP_PORT", "22")),
-                    user=os.getenv("SFTP_USER", ""),
-                    password=os.getenv("SFTP_PASSWORD", ""),
-                    known_hosts=os.getenv("SFTP_KNOWN_HOSTS", "none"),
+                smb=SMBConfig(
+                    enabled=os.getenv("SMB_ENABLED", "false").lower() in ("true", "1", "yes"),
+                    server_ip=os.getenv("SMB_SERVER_IP", ""),
+                    username=os.getenv("SMB_USERNAME", ""),
+                    password=os.getenv("SMB_PASSWORD", ""),
+                    share_name=os.getenv("SMB_SHARE_NAME", ""),
+                    port=int(os.getenv("SMB_PORT", "445")),
                 ),
                 logging=LoggingConfig(
-                level=os.getenv("LOG_LEVEL", "INFO").upper(),
-                log_file=os.getenv("LOG_FILE", "bot.log"),
-                max_bytes=int(os.getenv("LOG_MAX_BYTES", str(10 * 1024 * 1024))),  # 10 MB
-                backup_count=int(os.getenv("LOG_BACKUP_COUNT", "5"))
-                    ),
-                folders_file=folders_file)
+                    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+                    log_file=os.getenv("LOG_FILE", "bot.log"),
+                    max_bytes=int(os.getenv("LOG_MAX_BYTES", str(10 * 1024 * 1024))),  # 10 MB
+                    backup_count=int(os.getenv("LOG_BACKUP_COUNT", "5"))
+                        ),
+                    folders_file=folders_file,)
 ############################################################################################
 ALLOWED_DOCUMENT_MIMETYPES = [
     "application/pdf",

@@ -5,8 +5,8 @@ RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
 FROM python:3.12-slim
 LABEL maintainer="mkuznetcova"
-LABEL description="Matrix file distribution bot with SFTP support"
-LABEL version="1.0"
+LABEL description="Matrix file distribution bot with SMB support"
+LABEL version="3.0"
 
 RUN groupadd -r botuser && useradd -r -g botuser -d /app -s /sbin/nologin botuser
 WORKDIR /app

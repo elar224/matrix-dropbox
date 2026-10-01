@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 import logging
 import logging.handlers
@@ -7,7 +8,6 @@ import shutil
 import time
 from datetime import datetime
 from typing import Optional
-import io
 
 import nio
 from nio import (
@@ -20,13 +20,14 @@ from nio import (
 import redis.asyncio as redis
 
 try:
-    import asyncssh
-    ASYNCSSH_AVAILABLE = True
+    from smbclient import open_file, register_session, mkdir as smb_mkdir, stat as smb_stat
+    from smbprotocol.exceptions import SMBException
+
+    SMB_AVAILABLE = True
 except ImportError:
-    ASYNCSSH_AVAILABLE = False
+    SMB_AVAILABLE = False
 
 from config import load_config, load_folders, save_folders, ALLOWED_MIMETYPES
-
 
 # ============================================================
 # Конфигурация
@@ -37,9 +38,8 @@ DOWNLOAD_DIR = "/app/tmp_downloads"
 SYNC_TOKEN_FILE = "/app/data/sync_token"
 STATE_TTL_SECONDS = 3600
 REDIS_PREFIX = "pending"
-EVENT_MAX_AGE_SECONDS = 60  # Игнорируем события старше 60 секунд при старте
+EVENT_MAX_AGE_SECONDS = 60
 
-# Глобальный кэш папок (перечитывается при обновлении)
 TARGET_FOLDERS: dict[str, str] = {}
 
 
@@ -75,7 +75,7 @@ def setup_logging() -> logging.Logger:
     logging.getLogger("nio").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
-    logging.getLogger("asyncssh").setLevel(logging.WARNING)
+    logging.getLogger("smbprotocol").setLevel(logging.WARNING)
 
     return logger
 
@@ -100,37 +100,22 @@ class StateManager:
     def _key(self, room_id: str, user_id: str) -> str:
         return f"{REDIS_PREFIX}:{room_id}:{user_id}"
 
-    async def set_pending_file(
-        self, room_id: str, user_id: str, temp_path: str, filename: str
-    ) -> None:
+    async def set_pending_file(self, room_id: str, user_id: str, temp_path: str, filename: str):
         data = {
             "state": "pending_file",
             "temp_path": temp_path,
             "filename": filename,
             "created_at": time.time(),
         }
-        await self.redis.set(
-            self._key(room_id, user_id),
-            json.dumps(data),
-            ex=STATE_TTL_SECONDS,
-        )
+        await self.redis.set(self._key(room_id, user_id), json.dumps(data), ex=STATE_TTL_SECONDS)
 
-    async def set_awaiting_folders(self, room_id: str, user_id: str) -> None:
-        data = {
-            "state": "awaiting_folders",
-            "created_at": time.time(),
-        }
-        await self.redis.set(
-            self._key(room_id, user_id),
-            json.dumps(data),
-            ex=STATE_TTL_SECONDS,
-        )
+    async def set_awaiting_folders(self, room_id: str, user_id: str):
+        data = {"state": "awaiting_folders", "created_at": time.time()}
+        await self.redis.set(self._key(room_id, user_id), json.dumps(data), ex=STATE_TTL_SECONDS)
 
     async def get_pending(self, room_id: str, user_id: str) -> Optional[dict]:
         raw = await self.redis.get(self._key(room_id, user_id))
-        if raw is None:
-            return None
-        return json.loads(raw)
+        return json.loads(raw) if raw else None
 
     async def delete_pending(self, room_id: str, user_id: str) -> bool:
         return bool(await self.redis.delete(self._key(room_id, user_id)))
@@ -143,96 +128,107 @@ class StateManager:
 
 
 # ============================================================
-# SFTP-клиент
+# SMB-клиент
 # ============================================================
-class SFTPClient:
-    def __init__(self):
-        self.conn: Optional[asyncssh.SSHClientConnection] = None
+class SMBClient:
+    """Работа с SMB-шарой через smbprotocol.
 
-    async def connect(self) -> bool:
-        if not ASYNCSSH_AVAILABLE:
-            logger.error("asyncssh не установлен. SFTP недоступен.")
+    Пути в folders.json имеют формат: smb:/subfolder/path
+    (относительно корня шары).
+    """
+
+    def __init__(self):
+        self._registered = False
+
+    async def register(self) -> bool:
+        """Регистрирует сессию SMB (один раз)."""
+        if not SMB_AVAILABLE:
+            logger.error("smbprotocol не установлен. SMB недоступен.")
             return False
-        if not config.sftp.enabled:
-            logger.info("SFTP отключён в конфигурации.")
+        if not config.smb.enabled:
+            logger.info("SMB отключён в конфигурации.")
             return False
+        if self._registered:
+            return True
 
         try:
-            known_hosts = config.sftp.known_hosts
-            ssh_options = {}
-            if known_hosts and known_hosts != "none" and os.path.exists(known_hosts):
-                ssh_options["known_hosts"] = known_hosts
-            else:
-                ssh_options["known_hosts"] = None
-
-            self.conn = await asyncssh.connect(
-                config.sftp.host,
-                port=config.sftp.port,
-                username=config.sftp.user,
-                password=config.sftp.password,
-                **ssh_options,
+            # register_session сохраняет учётные данные глобально
+            await asyncio.to_thread(
+                register_session,
+                config.smb.server_ip,
+                config.smb.username,
+                config.smb.password,
+                port=config.smb.port,
             )
-            logger.info(f"SFTP подключён: {config.sftp.host}:{config.sftp.port}")
+            self._registered = True
+            logger.info(f"SMB-сессия зарегистрирована: {config.smb.server_ip}/{config.smb.share_name}")
             return True
         except Exception as e:
-            logger.error(f"Ошибка подключения к SFTP: {e}")
+            logger.error(f"Ошибка регистрации SMB-сессии: {e}")
             return False
 
-    async def close(self):
-        if self.conn:
-            self.conn.close()
-            self.conn = None
+    def _unc_path(self, relative_path: str) -> str:
+        """Формирует UNC-путь: \\<server>\<share>\<path>"""
+        # Убираем префикс smb:/ если есть
+        if relative_path.startswith("smb:/"):
+            relative_path = relative_path[5:]
+        relative_path = relative_path.strip("/")
+        # smbprotocol ожидает путь с обратными слешами
+        if relative_path:
+            return f"\\\\{config.smb.server_ip}\\{config.smb.share_name}\\{relative_path.replace('/', os.sep)}"
+        return f"\\\\{config.smb.server_ip}\\{config.smb.share_name}"
 
-    async def upload_file(self, local_path: str, remote_path: str) -> bool:
-        if not self.conn:
-            if not await self.connect():
-                return False
+    async def ensure_dir(self, relative_path: str) -> bool:
+        """Создаёт директорию рекурсивно на SMB-шаре."""
+        if not await self.register():
+            return False
 
+        parts = relative_path.strip("/").split("/") if relative_path.strip("/") else []
+        current = ""
         try:
-            async with self.conn.start_sftp_client() as sftp:
-                # Создаём директории рекурсивно
-                remote_dir = os.path.dirname(remote_path)
-                await self._makedirs(sftp, remote_dir)
-                await sftp.put(local_path, remote_path)
-                logger.info(f"Файл загружен по SFTP: {local_path} -> {remote_path}")
-                return True
-        except Exception as e:
-            logger.error(f"Ошибка загрузки по SFTP: {e}")
-            # Переподключаемся при ошибке
-            await self.close()
-            return False
-
-    async def _makedirs(self, sftp, path: str):
-        """Создаёт директорию рекурсивно."""
-        if not path or path == "/":
-            return
-        parts = path.strip("/").split("/")
-        current = "/"
-        for part in parts:
-            current = os.path.join(current, part)
-            try:
-                await sftp.stat(current)
-            except asyncssh.SFTPError:
+            for part in parts:
+                current = f"{current}/{part}" if current else part
+                unc = self._unc_path(current)
                 try:
-                    await sftp.mkdir(current)
-                except asyncssh.SFTPError:
-                    pass  # Директория уже существует
-
-    async def ensure_dir(self, remote_path: str) -> bool:
-        if not self.conn:
-            if not await self.connect():
-                return False
-        try:
-            async with self.conn.start_sftp_client() as sftp:
-                await self._makedirs(sftp, remote_path)
-                return True
+                    await asyncio.to_thread(smb_stat, unc)
+                except Exception:
+                    # Директории нет — создаём
+                    try:
+                        await asyncio.to_thread(smb_mkdir, unc)
+                        logger.info(f"Создана SMB-директория: {unc}")
+                    except Exception as e:
+                        logger.error(f"Не удалось создать SMB-директорию {unc}: {e}")
+                        return False
+            return True
         except Exception as e:
-            logger.error(f"Ошибка создания директории по SFTP: {e}")
+            logger.error(f"Ошибка ensure_dir: {e}")
+            return False
+
+    async def upload_file(self, local_path: str, remote_relative_path: str) -> bool:
+        """Загружает локальный файл на SMB-шару."""
+        if not await self.register():
+            return False
+
+        unc = self._unc_path(remote_relative_path)
+        try:
+            with open(local_path, "rb") as src:
+                data = src.read()
+
+            def _write():
+                with open_file(unc, mode="wb") as dst:
+                    dst.write(data)
+
+            await asyncio.to_thread(_write)
+            logger.info(f"Файл загружен на SMB: {local_path} -> {unc}")
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка загрузки на SMB: {e}")
+            # При ошибке сбрасываем сессию, чтобы пересоздать при следующей попытке
+            self._registered = False
             return False
 
 
-sftp_client = SFTPClient()
-
+smb_client = SMBClient()
 
 # ============================================================
 # Клиент Matrix и вспомогательные функции
@@ -246,7 +242,6 @@ def is_admin(user_id: str) -> bool:
 
 
 def is_event_too_old(event) -> bool:
-    """Проверяет, старше ли событие EVENT_MAX_AGE_SECONDS."""
     ts = event.source.get("origin_server_ts", 0) / 1000
     return (time.time() - ts) > EVENT_MAX_AGE_SECONDS
 
@@ -265,24 +260,17 @@ async def send_file(room_id: str, filename: str, content: bytes, mimetype: str =
     """Отправляет файл в комнату."""
     try:
         buffer = io.BytesIO(content)
-
         upload_response = await client.upload(
             buffer,
             filename=filename,
             content_type=mimetype,
             filesize=len(content),
         )
-
-        # Отладка: смотрим, что вернул upload
-        logger.debug(f"upload_response type: {type(upload_response).__name__}, value: {upload_response}")
-
         if isinstance(upload_response, nio.UploadError):
             logger.error(f"Ошибка загрузки файла: {upload_response.message}")
             return False
 
-        # Извлекаем URI с явной конвертацией в строку
         if isinstance(upload_response, tuple):
-            # Первый элемент кортежа - это объект UploadResponse
             content_uri = str(upload_response[0].content_uri)
         elif hasattr(upload_response, 'content_uri'):
             content_uri = str(upload_response.content_uri)
@@ -290,15 +278,12 @@ async def send_file(room_id: str, filename: str, content: bytes, mimetype: str =
             logger.error(f"Неизвестный тип upload_response: {type(upload_response)}")
             return False
 
-        logger.debug(f"Извлечён content_uri: {content_uri}")
-
         await client.room_send(room_id, "m.room.message", {
             "msgtype": "m.file",
             "body": filename,
             "url": content_uri,
             "info": {"mimetype": mimetype, "size": len(content)},
         })
-        logger.info(f"Файл {filename} успешно отправлен в комнату {room_id}")
         return True
     except Exception as e:
         logger.error(f"Ошибка отправки файла: {e}", exc_info=True)
@@ -320,8 +305,8 @@ def build_menu_text(filename: str) -> str:
     global TARGET_FOLDERS
     text = f"Получен файл: {filename}\n\nКуда его сохранить? Ответьте цифрой:\n"
     for key, folder_path in TARGET_FOLDERS.items():
-        if folder_path.startswith("sftp:"):
-            display = f"[SFTP] {folder_path[5:]}"
+        if folder_path.startswith("smb:/"):
+            display = f"[SMB] {folder_path[5:]}"
         else:
             display = os.path.basename(folder_path)
         text += f"{key}. {display}\n"
@@ -329,13 +314,12 @@ def build_menu_text(filename: str) -> str:
     return text
 
 
-def is_sftp_path(path: str) -> bool:
-    return path.startswith("sftp:")
+def is_smb_path(path: str) -> bool:
+    return path.startswith("smb:/")
 
 
 def get_remote_path(path: str) -> str:
-    """Извлекает удалённый путь из sftp:/path."""
-    return path[5:] if path.startswith("sftp:") else path
+    return path[5:] if path.startswith("smb:/") else path
 
 
 # ============================================================
@@ -343,17 +327,13 @@ def get_remote_path(path: str) -> str:
 # ============================================================
 async def handle_file_event(room: MatrixRoom, event):
     """Обработчик входящих файлов и изображений."""
-    # Игнорируем старые события
     if is_event_too_old(event):
         logger.debug(f"Игнорирую старое событие файла от {event.sender}")
         return
 
-    # Игнорируем сообщения самого бота
     if event.sender == client.user_id:
         return
 
-    # Если пользователь ожидает файл со списком папок — пропускаем,
-    # его обработает handle_folders_file
     pending = await state.get_pending(room.room_id, event.sender)
     if pending and pending.get("state") == "awaiting_folders":
         logger.debug(f"Файл от {event.sender} пропущен (состояние awaiting_folders)")
@@ -383,7 +363,6 @@ async def handle_file_event(room: MatrixRoom, event):
 
     logger.info(f"Файл принят в работу: {filename} от {event.sender}")
 
-    # Проверяем состояние пользователя
     existing = await state.get_pending(room.room_id, event.sender)
     if existing:
         old_path = existing.get("temp_path")
@@ -398,7 +377,6 @@ async def handle_file_event(room: MatrixRoom, event):
             "У вас уже есть незавершённый запрос. Предыдущий файл удалён. Обрабатываю новый.",
         )
 
-    # Скачиваем файл
     try:
         response = await client.download(mxc_url)
     except Exception as e:
@@ -430,7 +408,6 @@ async def handle_file_event(room: MatrixRoom, event):
 
 async def on_room_message(room: MatrixRoom, event):
     """Обработчик текстовых сообщений."""
-    # Игнорируем старые события
     if is_event_too_old(event):
         return
 
@@ -467,7 +444,7 @@ async def on_room_message(room: MatrixRoom, event):
                 room.room_id,
                 "Отправлен файл folders.json с текущим списком папок. "
                 "Отредактируйте его и отправьте обратно. "
-                "Формат: {\"1\": \"/path\", \"2\": \"sftp:/remote/path\"}. "
+                "Формат: {\"1\": \"/local/path\", \"2\": \"smb:/remote/path\"}. "
                 "Для отмены отправьте /cancel.",
             )
             logger.info(f"Файл folders.json отправлен админу {event.sender}")
@@ -496,7 +473,6 @@ async def on_room_message(room: MatrixRoom, event):
 
     state_type = pending.get("state")
 
-    # Ожидание файла со списком папок
     if state_type == "awaiting_folders":
         await send_message(
             room.room_id,
@@ -504,7 +480,6 @@ async def on_room_message(room: MatrixRoom, event):
         )
         return
 
-    # Выбор папки для файла
     if state_type == "pending_file":
         choice = text
         if choice not in TARGET_FOLDERS:
@@ -518,10 +493,11 @@ async def on_room_message(room: MatrixRoom, event):
         folder_path = TARGET_FOLDERS[choice]
         final_filename = pending["filename"]
 
-        if is_sftp_path(folder_path):
-            # Загрузка по SFTP
-            remote_path = os.path.join(get_remote_path(folder_path), final_filename)
-            success = await sftp_client.upload_file(src_path, remote_path)
+        if is_smb_path(folder_path):
+            # Загрузка по SMB
+            remote_subpath = get_remote_path(folder_path)
+            remote_full_path = f"{remote_subpath}/{final_filename}" if remote_subpath else final_filename
+            success = await smb_client.upload_file(src_path, remote_full_path)
             if success:
                 try:
                     os.remove(src_path)
@@ -529,11 +505,11 @@ async def on_room_message(room: MatrixRoom, event):
                     pass
                 await send_message(
                     room.room_id,
-                    f"Файл загружен на удалённый сервер: {remote_path}",
+                    f"Файл загружен на SMB-шару: {config.smb.server_ip}/{config.smb.share_name}/{remote_full_path}",
                 )
-                logger.info(f"Файл загружен по SFTP: {remote_path}")
+                logger.info(f"Файл загружен на SMB: {remote_full_path}")
             else:
-                await send_message(room.room_id, "Ошибка загрузки файла на удалённый сервер.")
+                await send_message(room.room_id, "Ошибка загрузки файла на SMB-шару.")
                 return
         else:
             # Локальное сохранение
@@ -577,7 +553,6 @@ async def handle_folders_file(room: MatrixRoom, event):
     if not mxc_url:
         return
 
-    # Скачиваем файл
     try:
         response = await client.download(mxc_url)
     except Exception as e:
@@ -590,12 +565,10 @@ async def handle_folders_file(room: MatrixRoom, event):
         await send_message(room.room_id, "Ошибка при скачивании файла.")
         return
 
-    # Парсим JSON
     try:
         new_folders = json.loads(response.body.decode("utf-8"))
         if not isinstance(new_folders, dict):
             raise ValueError("Ожидается объект JSON")
-        # Валидация
         for key, value in new_folders.items():
             if not isinstance(key, str) or not isinstance(value, str):
                 raise ValueError(f"Неверный формат: ключ {key}, значение {value}")
@@ -604,7 +577,6 @@ async def handle_folders_file(room: MatrixRoom, event):
         await send_message(room.room_id, f"Ошибка в формате файла: {e}")
         return
 
-    # Сохраняем новый список
     global TARGET_FOLDERS
     try:
         save_folders(config.folders_file, new_folders)
@@ -615,10 +587,15 @@ async def handle_folders_file(room: MatrixRoom, event):
         await send_message(room.room_id, f"Ошибка сохранения файла: {e}")
         return
 
-    # Создаём недостающие локальные папки
+    # Создаём недостающие папки
     created = []
     for key, path in new_folders.items():
-        if not is_sftp_path(path):
+        if is_smb_path(path):
+            remote_path = get_remote_path(path)
+            success = await smb_client.ensure_dir(remote_path)
+            if success:
+                created.append(f"[SMB] {remote_path}")
+        else:
             if not os.path.exists(path):
                 try:
                     os.makedirs(path, exist_ok=True)
@@ -626,12 +603,6 @@ async def handle_folders_file(room: MatrixRoom, event):
                     logger.info(f"Создана папка: {path}")
                 except OSError as e:
                     logger.error(f"Не удалось создать папку {path}: {e}")
-        else:
-            # Создаём удалённую папку по SFTP
-            remote_path = get_remote_path(path)
-            success = await sftp_client.ensure_dir(remote_path)
-            if success:
-                created.append(f"[SFTP] {remote_path}")
 
     await state.delete_pending(room.room_id, event.sender)
 
@@ -645,7 +616,6 @@ async def handle_folders_file(room: MatrixRoom, event):
 # Фоновые задачи
 # ============================================================
 async def orphan_cleanup_loop():
-    """Очистка orphan-файлов."""
     while True:
         try:
             await asyncio.sleep(600)
@@ -672,17 +642,14 @@ async def orphan_cleanup_loop():
 
 
 async def sync_token_saver():
-    """Периодически сохраняет sync_token на диск."""
     while True:
         try:
             await asyncio.sleep(10)
-            # Безопасно получаем sync_token через getattr
             token = getattr(client, "sync_token", None)
             if token:
                 os.makedirs(os.path.dirname(SYNC_TOKEN_FILE) or ".", exist_ok=True)
                 with open(SYNC_TOKEN_FILE, "w") as f:
                     f.write(token)
-                logger.debug(f"sync_token сохранён: {token[:20]}...")
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -690,7 +657,6 @@ async def sync_token_saver():
 
 
 async def invite_checker_loop():
-    """Автоматически принимает приглашения в комнаты."""
     while True:
         try:
             await asyncio.sleep(5)
@@ -716,14 +682,12 @@ async def invite_checker_loop():
 async def main():
     global TARGET_FOLDERS
 
-    # Загружаем список папок
     TARGET_FOLDERS = load_folders(config.folders_file)
     if not TARGET_FOLDERS:
         logger.warning("Список папок пуст. Используйте команду /list для настройки.")
     else:
         logger.info(f"Загружено папок: {len(TARGET_FOLDERS)}")
 
-    # Загружаем sync_token
     if os.path.exists(SYNC_TOKEN_FILE):
         try:
             with open(SYNC_TOKEN_FILE) as f:
@@ -734,7 +698,6 @@ async def main():
         except Exception as e:
             logger.warning(f"Не удалось загрузить sync_token: {e}")
 
-    # Авторизация
     if config.mtrx_bot.mtrx_token:
         client.access_token = config.mtrx_bot.mtrx_token
         client.user_id = config.mtrx_bot.mtrx_user_id
@@ -765,50 +728,14 @@ async def main():
             logger.error(f"Ошибка логина: {e}")
             return
 
-    # Подключаемся к SFTP, если включён
-    # if config.sftp.enabled:
-    #     await sftp_client.connect()
-    #
-    # # Регистрация callback'ов
-    # client.add_event_callback(on_room_message, RoomMessageText)
-    # client.add_event_callback(handle_file_event, RoomMessageFile)
-    # client.add_event_callback(handle_file_event, RoomMessageImage)
-    # client.add_event_callback(handle_folders_file, RoomMessageFile)
-    #
-    # logger.info("Callback'и зарегистрированы. Запускаю sync_forever...")
-    print("DEBUG: Авторизация завершена")
-
-    # Подключаемся к SFTP, если включён
-    if config.sftp.enabled:
-        print("DEBUG: Подключаюсь к SFTP...")
-        try:
-            await sftp_client.connect()
-        except Exception as e:
-            print(f"DEBUG: Ошибка SFTP: {e}")
-            logger.error(f"Ошибка подключения к SFTP: {e}")
-    else:
-        print("DEBUG: SFTP отключён")
-
-    print("DEBUG: Регистрирую callback'и...")
-
-    # Регистрация callback'ов
-    try:
-        client.add_event_callback(on_room_message, RoomMessageText)
-        print("DEBUG: RoomMessageText зарегистрирован")
-        client.add_event_callback(handle_file_event, RoomMessageFile)
-        print("DEBUG: RoomMessageFile зарегистрирован")
-        client.add_event_callback(handle_file_event, RoomMessageImage)
-        print("DEBUG: RoomMessageImage зарегистрирован")
-        client.add_event_callback(handle_folders_file, RoomMessageFile)
-        print("DEBUG: handle_folders_file зарегистрирован")
-    except Exception as e:
-        print(f"DEBUG: Ошибка регистрации callback'ов: {e}")
-        logger.error(f"Ошибка регистрации callback'ов: {e}", exc_info=True)
-        return
+    # Регистрируем callback'и
+    client.add_event_callback(on_room_message, RoomMessageText)
+    client.add_event_callback(handle_file_event, RoomMessageFile)
+    client.add_event_callback(handle_file_event, RoomMessageImage)
+    client.add_event_callback(handle_folders_file, RoomMessageFile)
 
     logger.info("Callback'и зарегистрированы. Запускаю sync_forever...")
-    print("DEBUG: Запускаю sync_forever...")
-    # Запускаем фоновые задачи
+
     cleanup_task = asyncio.create_task(orphan_cleanup_loop())
     token_saver_task = asyncio.create_task(sync_token_saver())
     invite_task = asyncio.create_task(invite_checker_loop())
@@ -820,30 +747,23 @@ async def main():
     except Exception as e:
         logger.error(f"Критическая ошибка в sync_forever: {e}", exc_info=True)
     finally:
-        # Сохраняем sync_token перед остановкой
-        # Сохраняем sync_token перед остановкой
         token = getattr(client, "sync_token", None)
         if token:
             try:
                 os.makedirs(os.path.dirname(SYNC_TOKEN_FILE) or ".", exist_ok=True)
                 with open(SYNC_TOKEN_FILE, "w") as f:
                     f.write(token)
-                logger.info(f"sync_token сохранён: {token[:20]}...")
+                logger.info("sync_token сохранён")
             except Exception as e:
                 logger.error(f"Ошибка сохранения sync_token: {e}")
-        else:
-            logger.debug("sync_token отсутствует, нечего сохранять")
 
-        cleanup_task.cancel()
-        token_saver_task.cancel()
-        invite_task.cancel()
         for task in [cleanup_task, token_saver_task, invite_task]:
+            task.cancel()
             try:
                 await task
             except asyncio.CancelledError:
                 pass
 
-        await sftp_client.close()
         await state.close()
         await client.close()
         logger.info("Бот остановлен, ресурсы освобождены")
