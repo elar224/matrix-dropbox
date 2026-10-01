@@ -293,7 +293,7 @@ def build_menu_text(filename: str) -> str:
     text = f"Получен файл: {filename}\n\nКуда его сохранить? Ответьте цифрой:\n"
     for key, folder_path in TARGET_FOLDERS.items():
         if folder_path.startswith("smb:/"):
-            display = f"[SMB] {folder_path[5:]}"
+            display = f"{folder_path[5:]}"
         else:
             display = os.path.basename(folder_path)
         text += f"{key}. {display}\n"
@@ -480,7 +480,7 @@ async def on_room_message(room: MatrixRoom, event):
         final_filename = pending["filename"]
 
         if is_smb_path(folder_path):
-            # Загрузка по SMB
+            # Загрузка по smb
             remote_subpath = get_remote_path(folder_path)
             remote_full_path = f"{remote_subpath}/{final_filename}" if remote_subpath else final_filename
             success = await smb_client.upload_file(src_path, remote_full_path)
@@ -580,7 +580,7 @@ async def handle_folders_file(room: MatrixRoom, event):
             remote_path = get_remote_path(path)
             success = await smb_client.ensure_dir(remote_path)
             if success:
-                created.append(f"[SMB] {remote_path}")
+                created.append(f"{remote_path}")
         else:
             if not os.path.exists(path):
                 try:
