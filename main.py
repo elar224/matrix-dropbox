@@ -29,9 +29,7 @@ except ImportError:
 
 from config import load_config, load_folders, save_folders, ALLOWED_MIMETYPES
 
-# ============================================================
-# Конфигурация
-# ============================================================
+#Конфиги
 config = load_config()
 
 DOWNLOAD_DIR = "/app/tmp_downloads"
@@ -43,9 +41,7 @@ EVENT_MAX_AGE_SECONDS = 60
 TARGET_FOLDERS: dict[str, str] = {}
 
 
-# ============================================================
 # Логирование
-# ============================================================
 def setup_logging() -> logging.Logger:
     logger = logging.getLogger("matrix_bot")
     logger.setLevel(getattr(logging, config.logging.level, logging.INFO))
@@ -83,9 +79,7 @@ def setup_logging() -> logging.Logger:
 logger = setup_logging()
 
 
-# ============================================================
-# Машина состояний на Redis
-# ============================================================
+#FSM на Redis
 class StateManager:
     def __init__(self):
         redis_url = f"redis://{config.db.host}:{config.db.port}"
@@ -127,26 +121,19 @@ class StateManager:
                 yield key, json.loads(raw)
 
 
-# ============================================================
-# SMB-клиент
-# ============================================================
+#SMB-клиент
+
 class SMBClient:
-    """Работа с SMB-шарой через smbprotocol.
-
-    Пути в folders.json имеют формат: smb:/subfolder/path
-    (относительно корня шары).
-    """
-
     def __init__(self):
         self._registered = False
 
     async def register(self) -> bool:
-        """Регистрирует сессию SMB (один раз)."""
+       ###Регистрирует сессию smb (один раз)
         if not SMB_AVAILABLE:
-            logger.error("smbprotocol не установлен. SMB недоступен.")
+            logger.error("smbprotocol не установлен. smb недоступен.")
             return False
         if not config.smb.enabled:
-            logger.info("SMB отключён в конфигурации.")
+            logger.info("smb отключён в конфигурации.")
             return False
         if self._registered:
             return True
@@ -161,14 +148,14 @@ class SMBClient:
                 port=config.smb.port,
             )
             self._registered = True
-            logger.info(f"SMB-сессия зарегистрирована: {config.smb.server_ip}/{config.smb.share_name}")
+            logger.info(f"smb-сессия зарегистрирована: {config.smb.server_ip}/{config.smb.share_name}")
             return True
         except Exception as e:
-            logger.error(f"Ошибка регистрации SMB-сессии: {e}")
+            logger.error(f"Ошибка регистрации smb-сессии: {e}")
             return False
 
     def _unc_path(self, relative_path: str) -> str:
-        """Формирует UNC-путь: \\<server>\<share>\<path>"""
+        ###Формирует UNC-путь: \\<server>\<share>\<path>
         # Убираем префикс smb:/ если есть
         if relative_path.startswith("smb:/"):
             relative_path = relative_path[5:]
@@ -179,7 +166,7 @@ class SMBClient:
         return f"\\\\{config.smb.server_ip}\\{config.smb.share_name}"
 
     async def ensure_dir(self, relative_path: str) -> bool:
-        """Создаёт директорию рекурсивно на SMB-шаре."""
+        ###Создаёт директорию рекурсивно на smb-шаре
         if not await self.register():
             return False
 
@@ -195,9 +182,9 @@ class SMBClient:
                     # Директории нет — создаём
                     try:
                         await asyncio.to_thread(smb_mkdir, unc)
-                        logger.info(f"Создана SMB-директория: {unc}")
+                        logger.info(f"Создана smb-директория: {unc}")
                     except Exception as e:
-                        logger.error(f"Не удалось создать SMB-директорию {unc}: {e}")
+                        logger.error(f"Не удалось создать smb-директорию {unc}: {e}")
                         return False
             return True
         except Exception as e:
@@ -205,7 +192,7 @@ class SMBClient:
             return False
 
     async def upload_file(self, local_path: str, remote_relative_path: str) -> bool:
-        """Загружает локальный файл на SMB-шару."""
+        ###Загружает локальный файл на smb-шару
         if not await self.register():
             return False
 
@@ -219,10 +206,10 @@ class SMBClient:
                     dst.write(data)
 
             await asyncio.to_thread(_write)
-            logger.info(f"Файл загружен на SMB: {local_path} -> {unc}")
+            logger.info(f"Файл загружен на smb: {local_path} -> {unc}")
             return True
         except Exception as e:
-            logger.error(f"Ошибка загрузки на SMB: {e}")
+            logger.error(f"Ошибка загрузки на smb: {e}")
             # При ошибке сбрасываем сессию, чтобы пересоздать при следующей попытке
             self._registered = False
             return False
@@ -230,9 +217,9 @@ class SMBClient:
 
 smb_client = SMBClient()
 
-# ============================================================
 # Клиент Matrix и вспомогательные функции
-# ============================================================
+
+
 client = AsyncClient(config.mtrx_bot.mtrx_url)
 state = StateManager()
 
@@ -257,7 +244,7 @@ async def send_message(room_id: str, text: str):
 
 
 async def send_file(room_id: str, filename: str, content: bytes, mimetype: str = "text/plain"):
-    """Отправляет файл в комнату."""
+    ###Отправляет файл в комнату
     try:
         buffer = io.BytesIO(content)
         upload_response = await client.upload(
@@ -322,9 +309,8 @@ def get_remote_path(path: str) -> str:
     return path[5:] if path.startswith("smb:/") else path
 
 
-# ============================================================
-# Обработчики событий
-# ============================================================
+#Хэндлеры
+
 async def handle_file_event(room: MatrixRoom, event):
     """Обработчик входящих файлов и изображений."""
     if is_event_too_old(event):
@@ -407,7 +393,7 @@ async def handle_file_event(room: MatrixRoom, event):
 
 
 async def on_room_message(room: MatrixRoom, event):
-    """Обработчик текстовых сообщений."""
+    ###Обработчик текстовых сообщений
     if is_event_too_old(event):
         return
 
@@ -447,7 +433,7 @@ async def on_room_message(room: MatrixRoom, event):
                 "Формат: {\"1\": \"/local/path\", \"2\": \"smb:/remote/path\"}. "
                 "Для отмены отправьте /cancel.",
             )
-            logger.info(f"Файл folders.json отправлен админу {event.sender}")
+            logger.info(f"Файл folders.json отправлен администратору {event.sender}")
         return
 
     # Команда отмены
@@ -505,11 +491,11 @@ async def on_room_message(room: MatrixRoom, event):
                     pass
                 await send_message(
                     room.room_id,
-                    f"Файл загружен на SMB-шару: {config.smb.server_ip}/{config.smb.share_name}/{remote_full_path}",
+                    f"Файл загружен по адресу: {config.smb.server_ip}/{config.smb.share_name}/{remote_full_path}",
                 )
-                logger.info(f"Файл загружен на SMB: {remote_full_path}")
+                logger.info(f"Файл загружен по адресу: {remote_full_path}")
             else:
-                await send_message(room.room_id, "Ошибка загрузки файла на SMB-шару.")
+                await send_message(room.room_id, "Ошибка загрузки файла на удаленный диск.")
                 return
         else:
             # Локальное сохранение
@@ -537,7 +523,7 @@ async def on_room_message(room: MatrixRoom, event):
 
 
 async def handle_folders_file(room: MatrixRoom, event):
-    """Обработчик файла folders.json от админа."""
+    ###Обработчик файла folders.json от админа
     if is_event_too_old(event):
         return
 
@@ -612,9 +598,8 @@ async def handle_folders_file(room: MatrixRoom, event):
     await send_message(room.room_id, msg)
 
 
-# ============================================================
-# Фоновые задачи
-# ============================================================
+#Фоновые задачи
+
 async def orphan_cleanup_loop():
     while True:
         try:
@@ -676,9 +661,8 @@ async def invite_checker_loop():
             logger.error(f"Ошибка проверки приглашений: {e}", exc_info=True)
 
 
-# ============================================================
 # Точка входа
-# ============================================================
+
 async def main():
     global TARGET_FOLDERS
 

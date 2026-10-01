@@ -3,4 +3,4 @@ redis>=5.0.0
 python-dotenv>=1.0.0
 aiofiles>=23.0.0
 dotenv~=0.9.9
-asyncssh>=2.14.0
+smbprotocol>=1.12.0
