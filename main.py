@@ -91,36 +91,99 @@ class StateManager:
     async def close(self):
         await self.redis.aclose()
 
-    def _key(self, room_id: str, user_id: str) -> str:
-        return f"{REDIS_PREFIX}:{room_id}:{user_id}"
+    def _queue_key(self, room_id: str, user_id: str) -> str:
+        return f"{REDIS_PREFIX}:queue:{room_id}:{user_id}"
 
-    async def set_pending_file(self, room_id: str, user_id: str, temp_path: str, filename: str):
-        data = {
-            "state": "pending_file",
+    def _file_key(self, event_id: str) -> str:
+        return f"{REDIS_PREFIX}:file:{event_id}"
+
+    async def add_file_to_queue(
+            self, room_id: str, user_id: str, event_id: str, temp_path: str, filename: str
+    ):
+        ###Добавляет файл в очередь пользователя
+        # Сохраняем данные файла
+        file_data = {
+            "event_id": event_id,
             "temp_path": temp_path,
             "filename": filename,
             "created_at": time.time(),
         }
-        await self.redis.set(self._key(room_id, user_id), json.dumps(data), ex=STATE_TTL_SECONDS)
+        await self.redis.set(
+            self._file_key(event_id),
+            json.dumps(file_data),
+            ex=STATE_TTL_SECONDS,
+        )
 
-    async def set_awaiting_folders(self, room_id: str, user_id: str):
-        data = {"state": "awaiting_folders", "created_at": time.time()}
-        await self.redis.set(self._key(room_id, user_id), json.dumps(data), ex=STATE_TTL_SECONDS)
+        # Добавляем event_id в очередь (в конец)
+        await self.redis.rpush(self._queue_key(room_id, user_id), event_id)
 
-    async def get_pending(self, room_id: str, user_id: str) -> Optional[dict]:
-        raw = await self.redis.get(self._key(room_id, user_id))
-        return json.loads(raw) if raw else None
+        # Устанавливаем TTL на очередь
+        await self.redis.expire(self._queue_key(room_id, user_id), STATE_TTL_SECONDS)
 
-    async def delete_pending(self, room_id: str, user_id: str) -> bool:
-        return bool(await self.redis.delete(self._key(room_id, user_id)))
+        logger.debug(f"Файл добавлен в очередь: event_id={event_id}, user={user_id}")
 
-    async def iter_all_pending(self):
-        async for key in self.redis.scan_iter(match=f"{REDIS_PREFIX}:*"):
+    async def get_next_file(self, room_id: str, user_id: str) -> Optional[dict]:
+        ###Получает следующий файл из очереди (первый, но не удаляет)
+        queue_key = self._queue_key(room_id, user_id)
+        event_id = await self.redis.lindex(queue_key, 0)
+        if not event_id:
+            return None
+
+        file_data_raw = await self.redis.get(self._file_key(event_id))
+        if not file_data_raw:
+            # Файл истёк или удалён — убираем из очереди
+            await self.redis.lpop(queue_key)
+            return None
+
+        return json.loads(file_data_raw)
+
+    async def remove_file_from_queue(self, room_id: str, user_id: str) -> Optional[dict]:
+        ###Удаляет и возвращает первый файл из очереди
+        queue_key = self._queue_key(room_id, user_id)
+        event_id = await self.redis.lpop(queue_key)
+        if not event_id:
+            return None
+
+        file_data_raw = await self.redis.get(self._file_key(event_id))
+        await self.redis.delete(self._file_key(event_id))
+
+        if file_data_raw:
+            return json.loads(file_data_raw)
+        return None
+
+    async def get_queue_length(self, room_id: str, user_id: str) -> int:
+        ####Возвращает количество файлов в очереди
+        return await self.redis.llen(self._queue_key(room_id, user_id))
+
+    async def clear_queue(self, room_id: str, user_id: str) -> int:
+        ###Очищает всю очередь и удаляет все файлы
+        queue_key = self._queue_key(room_id, user_id)
+        event_ids = await self.redis.lrange(queue_key, 0, -1)
+
+        deleted_count = 0
+        for event_id in event_ids:
+            file_key = self._file_key(event_id)
+            file_data_raw = await self.redis.get(file_key)
+            if file_data_raw:
+                file_data = json.loads(file_data_raw)
+                temp_path = file_data.get("temp_path")
+                if temp_path and os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                        deleted_count += 1
+                    except OSError:
+                        pass
+            await self.redis.delete(file_key)
+
+        await self.redis.delete(queue_key)
+        return deleted_count
+
+    async def iter_all_files(self):
+        ####Итератор по всем файлам во всех очередях (для cleanup)
+        async for key in self.redis.scan_iter(match=f"{REDIS_PREFIX}:file:*"):
             raw = await self.redis.get(key)
             if raw:
                 yield key, json.loads(raw)
-
-
 #smb-клиент
 
 class SMBClient:
@@ -311,7 +374,7 @@ def get_remote_path(path: str) -> str:
 #Хэндлеры
 
 async def handle_file_event(room: MatrixRoom, event):
-    """Обработчик входящих файлов и изображений."""
+    ###Обработчик входящих файлов и изображений
     if is_event_too_old(event):
         logger.debug(f"Игнорирую старое событие файла от {event.sender}")
         return
@@ -319,10 +382,10 @@ async def handle_file_event(room: MatrixRoom, event):
     if event.sender == client.user_id:
         return
 
-    pending = await state.get_pending(room.room_id, event.sender)
-    if pending and pending.get("state") == "awaiting_folders":
-        logger.debug(f"Файл от {event.sender} пропущен (состояние awaiting_folders)")
-        return
+    # Проверяем, не ожидает ли пользователь отправки folders.json
+    queue_length = await state.get_queue_length(room.room_id, event.sender)
+    # Если очередь не пуста и первое состояние — awaiting_folders, пропускаем
+    # (но это уже обрабатывается в handle_folders_file, так что просто логируем)
 
     logger.info(
         f"Получено событие файла: room={room.room_id}, "
@@ -348,20 +411,7 @@ async def handle_file_event(room: MatrixRoom, event):
 
     logger.info(f"Файл принят в работу: {filename} от {event.sender}")
 
-    existing = await state.get_pending(room.room_id, event.sender)
-    if existing:
-        old_path = existing.get("temp_path")
-        if old_path and os.path.exists(old_path):
-            try:
-                os.remove(old_path)
-                logger.info(f"Удалён старый временный файл: {old_path}")
-            except OSError as e:
-                logger.error(f"Не удалось удалить старый файл {old_path}: {e}")
-        await send_message(
-            room.room_id,
-            "У вас уже есть незавершённый запрос. Предыдущий файл удалён. Обрабатываю новый.",
-        )
-
+    # Скачиваем файл
     try:
         response = await client.download(mxc_url)
     except Exception as e:
@@ -387,8 +437,22 @@ async def handle_file_event(room: MatrixRoom, event):
         await send_message(room.room_id, "Ошибка при сохранении файла на диск.")
         return
 
-    await state.set_pending_file(room.room_id, event.sender, temp_path, filename)
-    await send_message(room.room_id, build_menu_text(filename))
+    # Добавляем файл в очередь
+    await state.add_file_to_queue(room.room_id, event.sender, event.event_id, temp_path, filename)
+
+    # Проверяем, сколько файлов в очереди
+    queue_length = await state.get_queue_length(room.room_id, event.sender)
+
+    if queue_length == 1:
+        # Это первый файл — показываем меню
+        await send_message(room.room_id, build_menu_text(filename))
+    else:
+        # Уже есть файлы в очереди — просто подтверждаем добавление
+        await send_message(
+            room.room_id,
+            f"Файл {filename} добавлен в очередь. В очереди: {queue_length} файл(ов). "
+            f"Сначала обработайте предыдущие файлы.",
+        )
 
 
 async def on_room_message(room: MatrixRoom, event):
@@ -424,7 +488,6 @@ async def on_room_message(room: MatrixRoom, event):
             "application/json",
         )
         if success:
-            await state.set_awaiting_folders(room.room_id, event.sender)
             await send_message(
                 room.room_id,
                 "Отправлен файл folders.json с текущим списком папок. "
@@ -432,94 +495,105 @@ async def on_room_message(room: MatrixRoom, event):
                 "Формат: {\"1\": \"/local/path\", \"2\": \"smb:/remote/path\"}. "
                 "Для отмены отправьте /cancel.",
             )
-            logger.info(f"Файл folders.json отправлен администратору {event.sender}")
+            logger.info(f"Файл folders.json отправлен админу {event.sender}")
         return
 
     # Команда отмены
     if text.lower() == "/cancel":
-        pending = await state.get_pending(room.room_id, event.sender)
-        if pending:
-            if pending.get("state") == "pending_file":
-                temp_path = pending.get("temp_path")
-                if temp_path and os.path.exists(temp_path):
-                    try:
-                        os.remove(temp_path)
-                    except OSError as e:
-                        logger.error(f"Не удалось удалить {temp_path}: {e}")
-            await state.delete_pending(room.room_id, event.sender)
-            await send_message(room.room_id, "Операция отменена.")
-            logger.info(f"Операция отменена пользователем {event.sender}")
+        deleted_count = await state.clear_queue(room.room_id, event.sender)
+        if deleted_count > 0:
+            await send_message(room.room_id, f"Операция отменена. Удалено файлов: {deleted_count}.")
+            logger.info(f"Операция отменена пользователем {event.sender}, удалено {deleted_count} файлов")
+        else:
+            await send_message(room.room_id, "Нет активных операций для отмены.")
         return
 
-    # Обработка состояния
-    pending = await state.get_pending(room.room_id, event.sender)
-    if not pending:
-        return
+    # Обработка выбора папки
+    # Получаем первый файл из очереди
+    file_data = await state.get_next_file(room.room_id, event.sender)
+    if not file_data:
+        return  # Очередь пуста
 
-    state_type = pending.get("state")
-
-    if state_type == "awaiting_folders":
+    choice = text
+    if choice not in TARGET_FOLDERS:
+        queue_length = await state.get_queue_length(room.room_id, event.sender)
         await send_message(
             room.room_id,
-            "Ожидаю файл folders.json. Отправьте его или /cancel для отмены.",
+            f"Неверный выбор. Пожалуйста, ответьте цифрой из списка или отправьте /cancel.\n"
+            f"В очереди: {queue_length} файл(ов).",
         )
         return
 
-    if state_type == "pending_file":
-        choice = text
-        if choice not in TARGET_FOLDERS:
+    src_path = file_data["temp_path"]
+    folder_path = TARGET_FOLDERS[choice]
+    final_filename = file_data["filename"]
+
+    if is_smb_path(folder_path):
+        # Загрузка по smb
+        remote_subpath = get_remote_path(folder_path)
+        remote_full_path = f"{remote_subpath}/{final_filename}" if remote_subpath else final_filename
+        success = await smb_client.upload_file(src_path, remote_full_path)
+        if success:
+            try:
+                os.remove(src_path)
+            except OSError:
+                pass
+            # Удаляем файл из очереди
+            await state.remove_file_from_queue(room.room_id, event.sender)
+
             await send_message(
                 room.room_id,
-                "Неверный выбор. Пожалуйста, ответьте цифрой из списка или отправьте /cancel.",
+                f"Файл {final_filename} загружен на SMB-шару: {config.smb.server_ip}/{config.smb.share_name}/{remote_full_path}",
             )
-            return
+            logger.info(f"Файл загружен на SMB: {remote_full_path}")
 
-        src_path = pending["temp_path"]
-        folder_path = TARGET_FOLDERS[choice]
-        final_filename = pending["filename"]
-
-        if is_smb_path(folder_path):
-            # Загрузка по smb
-            remote_subpath = get_remote_path(folder_path)
-            remote_full_path = f"{remote_subpath}/{final_filename}" if remote_subpath else final_filename
-            success = await smb_client.upload_file(src_path, remote_full_path)
-            if success:
-                try:
-                    os.remove(src_path)
-                except OSError:
-                    pass
+            # Проверяем, есть ли ещё файлы в очереди
+            next_file = await state.get_next_file(room.room_id, event.sender)
+            if next_file:
                 await send_message(
                     room.room_id,
-                    f"Файл загружен по адресу: {config.smb.server_ip}/{config.smb.share_name}/{remote_full_path}",
+                    f"Следующий файл в очереди: {next_file['filename']}. "
+                    f"Выберите папку или отправьте /cancel.",
                 )
-                logger.info(f"Файл загружен по адресу: {remote_full_path}")
-            else:
-                await send_message(room.room_id, "Ошибка загрузки файла на удаленный диск.")
-                return
+                await send_message(room.room_id, build_menu_text(next_file["filename"]))
         else:
-            # Локальное сохранение
-            os.makedirs(folder_path, exist_ok=True)
-            dst_path = os.path.join(folder_path, final_filename)
+            await send_message(room.room_id, "Ошибка загрузки файла на SMB-шару.")
+            return
+    else:
+        # Локальное сохранение
+        os.makedirs(folder_path, exist_ok=True)
+        dst_path = os.path.join(folder_path, final_filename)
 
-            if os.path.exists(dst_path):
-                name, ext = os.path.splitext(final_filename)
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                dst_path = os.path.join(folder_path, f"{name}_{ts}{ext}")
+        if os.path.exists(dst_path):
+            name, ext = os.path.splitext(final_filename)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            dst_path = os.path.join(folder_path, f"{name}_{ts}{ext}")
 
-            try:
-                shutil.move(src_path, dst_path)
-                logger.info(f"Файл перемещён: {src_path} -> {dst_path}")
+        try:
+            shutil.move(src_path, dst_path)
+            logger.info(f"Файл перемещён: {src_path} -> {dst_path}")
+
+            # Удаляем файл из очереди
+            await state.remove_file_from_queue(room.room_id, event.sender)
+
+            await send_message(
+                room.room_id,
+                f"Файл {final_filename} сохранён в папку {os.path.basename(folder_path)}:\n{dst_path}",
+            )
+
+            # Проверяем, есть ли ещё файлы в очереди
+            next_file = await state.get_next_file(room.room_id, event.sender)
+            if next_file:
                 await send_message(
                     room.room_id,
-                    f"Файл сохранён в папку {os.path.basename(folder_path)}:\n{dst_path}",
+                    f"Следующий файл в очереди: {next_file['filename']}. "
+                    f"Выберите папку или отправьте /cancel.",
                 )
-            except OSError as e:
-                logger.error(f"Ошибка перемещения файла: {e}")
-                await send_message(room.room_id, f"Ошибка при сохранении: {e}")
-                return
-
-        await state.delete_pending(room.room_id, event.sender)
-
+                await send_message(room.room_id, build_menu_text(next_file["filename"]))
+        except OSError as e:
+            logger.error(f"Ошибка перемещения файла: {e}")
+            await send_message(room.room_id, f"Ошибка при сохранении: {e}")
+            return
 
 async def handle_folders_file(room: MatrixRoom, event):
     ###Обработчик файла folders.json от админа
@@ -600,18 +674,21 @@ async def handle_folders_file(room: MatrixRoom, event):
 #Фоновые задачи
 
 async def orphan_cleanup_loop():
+    ###Очистка orphan-файлов
     while True:
         try:
             await asyncio.sleep(600)
             if not os.path.exists(DOWNLOAD_DIR):
                 continue
 
+            # Собираем все активные пути из Redis
             active_paths = set()
-            async for _, data in state.iter_all_pending():
+            async for _, data in state.iter_all_files():
                 temp_path = data.get("temp_path")
                 if temp_path:
                     active_paths.add(temp_path)
 
+            # Удаляем файлы, которых нет в Redis
             for entry in os.scandir(DOWNLOAD_DIR):
                 if entry.is_file() and entry.path not in active_paths:
                     try:
@@ -623,7 +700,6 @@ async def orphan_cleanup_loop():
             break
         except Exception as e:
             logger.error(f"[cleanup] ошибка: {e}", exc_info=True)
-
 
 async def sync_token_saver():
     while True:
