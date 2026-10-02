@@ -147,6 +147,9 @@ class StateManager:
     def _queue_key(self, room_id: str, user_id: str) -> str:
         return f"{REDIS_PREFIX}:queue:{room_id}:{user_id}"
 
+    def _admin_state_key(self, room_id: str, user_id: str) -> str:
+        return f"{REDIS_PREFIX}:admin_state:{room_id}:{user_id}"
+
     def _file_key(self, event_id: str) -> str:
         return f"{REDIS_PREFIX}:file:{event_id}"
 
@@ -229,16 +232,34 @@ class StateManager:
             await self.redis.delete(file_key)
 
         await self.redis.delete(queue_key)
+        # Также очищаем состояние админа, если оно было
+        await self.redis.delete(self._admin_state_key(room_id, user_id))
         return deleted_count
 
     async def set_awaiting_folders(self, room_id: str, user_id: str):
         ###Специальное состояние для админа, загружающего folders.json
+        # ИСПРАВЛЕНО: используем отдельный ключ, чтобы не конфликтовать со списком (List) очереди
         data = {"state": "awaiting_folders", "created_at": time.time()}
         await self.redis.set(
-            self._queue_key(room_id, user_id),
+            self._admin_state_key(room_id, user_id),
             json.dumps(data),
             ex=STATE_TTL_SECONDS,
         )
+
+    async def is_awaiting_folders(self, room_id: str, user_id: str) -> bool:
+        ###Проверяет, находится ли пользователь в состоянии ожидания folders.json
+        raw = await self.redis.get(self._admin_state_key(room_id, user_id))
+        if raw:
+            try:
+                data = json.loads(raw)
+                return data.get("state") == "awaiting_folders"
+            except json.JSONDecodeError:
+                return False
+        return False
+
+    async def clear_awaiting_folders(self, room_id: str, user_id: str):
+        ###Очищает состояние ожидания folders.json
+        await self.redis.delete(self._admin_state_key(room_id, user_id))
 
     async def iter_all_files(self):
         ####Итератор по всем файлам во всех очередях (для cleanup)
@@ -446,8 +467,7 @@ async def handle_file_event(room: MatrixRoom, event):
         return
 
     # Проверяем, не ожидает ли пользователь отправки folders.json
-    pending = await state.get_next_file(room.room_id, event.sender)
-    if pending and pending.get("state") == "awaiting_folders":
+    if await state.is_awaiting_folders(room.room_id, event.sender):
         logger.debug(f"Файл от {event.sender} пропущен (состояние awaiting_folders)")
         return
 
@@ -521,7 +541,7 @@ async def handle_file_event(room: MatrixRoom, event):
 
 async def on_room_message(room: MatrixRoom, event):
     ###Обработчик текстовых сообщений
-    # ВАЖНО: global объявляем в самом начале функции
+
     global TARGET_FOLDERS
     global folders_cache
 
@@ -601,10 +621,6 @@ async def on_room_message(room: MatrixRoom, event):
     if not file_data:
         return  # Очередь пуста
 
-    # Пропускаем, если это состояние awaiting_folders (обрабатывается в handle_folders_file)
-    if file_data.get("state") == "awaiting_folders":
-        return
-
     choice = text
     if choice not in TARGET_FOLDERS:
         queue_length = await state.get_queue_length(room.room_id, event.sender)
@@ -640,7 +656,7 @@ async def on_room_message(room: MatrixRoom, event):
 
             # Проверяем, есть ли ещё файлы в очереди
             next_file = await state.get_next_file(room.room_id, event.sender)
-            if next_file and next_file.get("state") != "awaiting_folders":
+            if next_file:
                 await send_message(
                     room.room_id,
                     f"Следующий файл в очереди: {next_file['filename']}. "
@@ -674,7 +690,7 @@ async def on_room_message(room: MatrixRoom, event):
 
             # Проверяем, есть ли ещё файлы в очереди
             next_file = await state.get_next_file(room.room_id, event.sender)
-            if next_file and next_file.get("state") != "awaiting_folders":
+            if next_file:
                 await send_message(
                     room.room_id,
                     f"Следующий файл в очереди: {next_file['filename']}. "
@@ -689,7 +705,7 @@ async def on_room_message(room: MatrixRoom, event):
 
 async def handle_folders_file(room: MatrixRoom, event):
     ###Обработчик файла folders.json от админа
-    # ВАЖНО: global объявляем в самом начале функции
+
     global TARGET_FOLDERS
     global folders_cache
 
@@ -699,8 +715,8 @@ async def handle_folders_file(room: MatrixRoom, event):
     if not is_admin(event.sender):
         return
 
-    pending = await state.get_next_file(room.room_id, event.sender)
-    if not pending or pending.get("state") != "awaiting_folders":
+    # ИСПРАВЛЕНО: используем проверку состояния, а не get_next_file
+    if not await state.is_awaiting_folders(room.room_id, event.sender):
         return
 
     content = event.source.get("content", {})
@@ -761,7 +777,8 @@ async def handle_folders_file(room: MatrixRoom, event):
                 except OSError as e:
                     logger.error(f"Не удалось создать папку {path}: {e}")
 
-    await state.remove_file_from_queue(room.room_id, event.sender)
+    # ИСПРАВЛЕНО: очищаем состояние ожидания после успешной обработки
+    await state.clear_awaiting_folders(room.room_id, event.sender)
 
     msg = "Список папок обновлён."
     if created:
