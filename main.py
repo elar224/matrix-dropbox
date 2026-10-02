@@ -219,7 +219,6 @@ smb_client = SMBClient()
 
 # Клиент Matrix и вспомогательные функции
 
-
 client = AsyncClient(config.mtrx_bot.mtrx_url)
 state = StateManager()
 
