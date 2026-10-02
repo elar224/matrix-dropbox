@@ -41,6 +41,12 @@ EVENT_MAX_AGE_SECONDS = 60
 TARGET_FOLDERS: dict[str, str] = {}
 
 
+class FoldersCache:
+    pass
+
+
+folders_cache: Optional[FoldersCache] = None
+
 # Логирование
 def setup_logging() -> logging.Logger:
     logger = logging.getLogger("matrix_bot")
@@ -77,6 +83,57 @@ def setup_logging() -> logging.Logger:
 
 
 logger = setup_logging()
+
+#Кэш папок в FSM
+class FoldersCache:
+    ###Кэш списка папок в Redis
+
+    CACHE_KEY = "bot:folders"
+    CACHE_TTL = 30 * 24 * 3600  # 30 дней (перестраховка, ключ обновляется при каждом изменении)
+
+    def __init__(self, redis_client):
+        self.redis = redis_client
+
+    async def load(self) -> Optional[dict[str, str]]:
+        ####Загружает список папок из Redis
+        try:
+            raw = await self.redis.get(self.CACHE_KEY)
+            if not raw:
+                return None
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                logger.warning("Кэш folders в Redis имеет неверный формат")
+                return None
+            logger.info(f"Список папок загружен из Redis-кэша ({len(data)} папок)")
+            return data
+        except (json.JSONDecodeError, Exception) as e:
+            logger.error(f"Ошибка загрузки кэша folders из Redis: {e}")
+            return None
+
+    async def save(self, folders: dict[str, str]) -> bool:
+        ###Сохраняет список папок в Redis
+        try:
+            await self.redis.set(
+                self.CACHE_KEY,
+                json.dumps(folders, ensure_ascii=False),
+                ex=self.CACHE_TTL,
+            )
+            logger.info(f"Список папок сохранён в Redis-кэш ({len(folders)} папок)")
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка сохранения кэша folders в Redis: {e}")
+            return False
+
+    async def clear(self) -> bool:
+        ###Очищает кэш
+        try:
+            await self.redis.delete(self.CACHE_KEY)
+            logger.info("Кэш folders очищен")
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка очистки кэша folders: {e}")
+            return False
+
 
 
 #FSM на Redis
@@ -497,7 +554,27 @@ async def on_room_message(room: MatrixRoom, event):
             )
             logger.info(f"Файл folders.json отправлен админу {event.sender}")
         return
+    # Команда /reload для админов — принудительная перезагрузка из файла
+    if text.lower() == "/reload":
+        if not is_admin(event.sender):
+            await send_message(room.room_id, "У вас нет прав для выполнения этой команды.")
+            return
 
+        global TARGET_FOLDERS
+        new_folders = load_folders(config.folders_file)
+        if new_folders is None:
+            await send_message(room.room_id, "Ошибка чтения файла folders.json.")
+            return
+
+        TARGET_FOLDERS = new_folders
+        await folders_cache.save(new_folders)
+        await send_message(
+            room.room_id,
+            f"Список папок перезагружен из файла. Папок: {len(new_folders)}.",
+        )
+        logger.info(f"Список папок принудительно перезагружен админом {event.sender}")
+        return
+    
     # Команда отмены
     if text.lower() == "/cancel":
         deleted_count = await state.clear_queue(room.room_id, event.sender)
@@ -638,12 +715,15 @@ async def handle_folders_file(room: MatrixRoom, event):
 
     global TARGET_FOLDERS
     try:
+        # Сохраняем в файл (для персистентности)
         save_folders(config.folders_file, new_folders)
+        # Сохраняем в Redis-кэш (для быстрого доступа)
+        await folders_cache.save(new_folders)
         TARGET_FOLDERS = new_folders
-        logger.info(f"Список папок обновлён: {new_folders}")
+        logger.info(f"Список папок обновлён и сохранён в кэш: {new_folders}")
     except Exception as e:
-        logger.error(f"Ошибка сохранения folders.json: {e}")
-        await send_message(room.room_id, f"Ошибка сохранения файла: {e}")
+        logger.error(f"Ошибка сохранения folders: {e}")
+        await send_message(room.room_id, f"Ошибка сохранения: {e}")
         return
 
     # Создаём недостающие папки
@@ -741,11 +821,22 @@ async def invite_checker_loop():
 async def main():
     global TARGET_FOLDERS
 
-    TARGET_FOLDERS = load_folders(config.folders_file)
-    if not TARGET_FOLDERS:
-        logger.warning("Список папок пуст. Используйте команду /list для настройки.")
+    # Инициализируем кэш папок
+    global folders_cache
+    folders_cache = FoldersCache(state.redis)
+
+    # Приоритет загрузки: Redis → файл
+    TARGET_FOLDERS = await folders_cache.load()
+    if TARGET_FOLDERS is None:
+        logger.info("Кэш Redis пуст, загружаю из файла...")
+        TARGET_FOLDERS = load_folders(config.folders_file)
+        if TARGET_FOLDERS:
+            # Сохраняем в Redis для будущих запусков
+            await folders_cache.save(TARGET_FOLDERS)
+        else:
+            logger.warning("Список папок пуст. Используйте команду /list для настройки.")
     else:
-        logger.info(f"Загружено папок: {len(TARGET_FOLDERS)}")
+        logger.info(f"Загружено папок из кэша: {len(TARGET_FOLDERS)}")
 
     if os.path.exists(SYNC_TOKEN_FILE):
         try:
