@@ -121,7 +121,7 @@ class StateManager:
                 yield key, json.loads(raw)
 
 
-#SMB-клиент
+#smb-клиент
 
 class SMBClient:
     def __init__(self):
