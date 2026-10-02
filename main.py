@@ -30,6 +30,7 @@ except ImportError:
 from config import load_config, load_folders, save_folders, ALLOWED_MIMETYPES
 
 #Конфиги
+
 config = load_config()
 
 DOWNLOAD_DIR = "/app/tmp_downloads"
@@ -37,7 +38,6 @@ SYNC_TOKEN_FILE = "/app/data/sync_token"
 STATE_TTL_SECONDS = 3600
 REDIS_PREFIX = "pending"
 EVENT_MAX_AGE_SECONDS = 60
-
 TARGET_FOLDERS: dict[str, str] = {}
 
 
