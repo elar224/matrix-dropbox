@@ -29,7 +29,7 @@ except ImportError:
 
 from config import load_config, load_folders, save_folders, ALLOWED_MIMETYPES
 
-#Конфиги
+# Конфиги
 
 config = load_config()
 
@@ -40,12 +40,8 @@ REDIS_PREFIX = "pending"
 EVENT_MAX_AGE_SECONDS = 60
 TARGET_FOLDERS: dict[str, str] = {}
 
+folders_cache: Optional["FoldersCache"] = None
 
-class FoldersCache:
-    pass
-
-
-folders_cache: Optional[FoldersCache] = None
 
 # Логирование
 def setup_logging() -> logging.Logger:
@@ -84,7 +80,8 @@ def setup_logging() -> logging.Logger:
 
 logger = setup_logging()
 
-#Кэш папок в FSM
+
+# Кэш папок в FSM
 class FoldersCache:
     ###Кэш списка папок в Redis
 
@@ -135,8 +132,7 @@ class FoldersCache:
             return False
 
 
-
-#FSM на Redis
+# FSM на Redis
 class StateManager:
     def __init__(self):
         redis_url = f"redis://{config.db.host}:{config.db.port}"
@@ -235,20 +231,31 @@ class StateManager:
         await self.redis.delete(queue_key)
         return deleted_count
 
+    async def set_awaiting_folders(self, room_id: str, user_id: str):
+        ###Специальное состояние для админа, загружающего folders.json
+        data = {"state": "awaiting_folders", "created_at": time.time()}
+        await self.redis.set(
+            self._queue_key(room_id, user_id),
+            json.dumps(data),
+            ex=STATE_TTL_SECONDS,
+        )
+
     async def iter_all_files(self):
         ####Итератор по всем файлам во всех очередях (для cleanup)
         async for key in self.redis.scan_iter(match=f"{REDIS_PREFIX}:file:*"):
             raw = await self.redis.get(key)
             if raw:
                 yield key, json.loads(raw)
-#smb-клиент
+
+
+# smb-клиент
 
 class SMBClient:
     def __init__(self):
         self._registered = False
 
     async def register(self) -> bool:
-       ###Регистрирует сессию smb (один раз)
+        ###Регистрирует сессию smb (один раз)
         if not SMB_AVAILABLE:
             logger.error("smbprotocol не установлен. smb недоступен.")
             return False
@@ -408,7 +415,6 @@ def is_allowed_room(room_id: str) -> bool:
 
 
 def build_menu_text(filename: str) -> str:
-    global TARGET_FOLDERS
     text = f"Получен файл: {filename}\n\nКуда его сохранить? Ответьте цифрой:\n"
     for key, folder_path in TARGET_FOLDERS.items():
         if folder_path.startswith("smb:/"):
@@ -428,7 +434,7 @@ def get_remote_path(path: str) -> str:
     return path[5:] if path.startswith("smb:/") else path
 
 
-#Хэндлеры
+# Хэндлеры
 
 async def handle_file_event(room: MatrixRoom, event):
     ###Обработчик входящих файлов и изображений
@@ -440,9 +446,10 @@ async def handle_file_event(room: MatrixRoom, event):
         return
 
     # Проверяем, не ожидает ли пользователь отправки folders.json
-    queue_length = await state.get_queue_length(room.room_id, event.sender)
-    # Если очередь не пуста и первое состояние — awaiting_folders, пропускаем
-    # (но это уже обрабатывается в handle_folders_file, так что просто логируем)
+    pending = await state.get_next_file(room.room_id, event.sender)
+    if pending and pending.get("state") == "awaiting_folders":
+        logger.debug(f"Файл от {event.sender} пропущен (состояние awaiting_folders)")
+        return
 
     logger.info(
         f"Получено событие файла: room={room.room_id}, "
@@ -514,6 +521,10 @@ async def handle_file_event(room: MatrixRoom, event):
 
 async def on_room_message(room: MatrixRoom, event):
     ###Обработчик текстовых сообщений
+    # ВАЖНО: global объявляем в самом начале функции
+    global TARGET_FOLDERS
+    global folders_cache
+
     if is_event_too_old(event):
         return
 
@@ -536,7 +547,6 @@ async def on_room_message(room: MatrixRoom, event):
             logger.warning(f"Попытка выполнения /list не-админом: {event.sender}")
             return
 
-        global TARGET_FOLDERS
         folders_content = json.dumps(TARGET_FOLDERS, indent=2, ensure_ascii=False)
         success = await send_file(
             room.room_id,
@@ -545,6 +555,7 @@ async def on_room_message(room: MatrixRoom, event):
             "application/json",
         )
         if success:
+            await state.set_awaiting_folders(room.room_id, event.sender)
             await send_message(
                 room.room_id,
                 "Отправлен файл folders.json с текущим списком папок. "
@@ -560,7 +571,6 @@ async def on_room_message(room: MatrixRoom, event):
             await send_message(room.room_id, "У вас нет прав для выполнения этой команды.")
             return
 
-        global TARGET_FOLDERS
         new_folders = load_folders(config.folders_file)
         if new_folders is None:
             await send_message(room.room_id, "Ошибка чтения файла folders.json.")
@@ -574,7 +584,7 @@ async def on_room_message(room: MatrixRoom, event):
         )
         logger.info(f"Список папок принудительно перезагружен админом {event.sender}")
         return
-    
+
     # Команда отмены
     if text.lower() == "/cancel":
         deleted_count = await state.clear_queue(room.room_id, event.sender)
@@ -590,6 +600,10 @@ async def on_room_message(room: MatrixRoom, event):
     file_data = await state.get_next_file(room.room_id, event.sender)
     if not file_data:
         return  # Очередь пуста
+
+    # Пропускаем, если это состояние awaiting_folders (обрабатывается в handle_folders_file)
+    if file_data.get("state") == "awaiting_folders":
+        return
 
     choice = text
     if choice not in TARGET_FOLDERS:
@@ -626,7 +640,7 @@ async def on_room_message(room: MatrixRoom, event):
 
             # Проверяем, есть ли ещё файлы в очереди
             next_file = await state.get_next_file(room.room_id, event.sender)
-            if next_file:
+            if next_file and next_file.get("state") != "awaiting_folders":
                 await send_message(
                     room.room_id,
                     f"Следующий файл в очереди: {next_file['filename']}. "
@@ -660,7 +674,7 @@ async def on_room_message(room: MatrixRoom, event):
 
             # Проверяем, есть ли ещё файлы в очереди
             next_file = await state.get_next_file(room.room_id, event.sender)
-            if next_file:
+            if next_file and next_file.get("state") != "awaiting_folders":
                 await send_message(
                     room.room_id,
                     f"Следующий файл в очереди: {next_file['filename']}. "
@@ -672,15 +686,20 @@ async def on_room_message(room: MatrixRoom, event):
             await send_message(room.room_id, f"Ошибка при сохранении: {e}")
             return
 
+
 async def handle_folders_file(room: MatrixRoom, event):
     ###Обработчик файла folders.json от админа
+    # ВАЖНО: global объявляем в самом начале функции
+    global TARGET_FOLDERS
+    global folders_cache
+
     if is_event_too_old(event):
         return
 
     if not is_admin(event.sender):
         return
 
-    pending = await state.get_pending(room.room_id, event.sender)
+    pending = await state.get_next_file(room.room_id, event.sender)
     if not pending or pending.get("state") != "awaiting_folders":
         return
 
@@ -713,7 +732,6 @@ async def handle_folders_file(room: MatrixRoom, event):
         await send_message(room.room_id, f"Ошибка в формате файла: {e}")
         return
 
-    global TARGET_FOLDERS
     try:
         # Сохраняем в файл (для персистентности)
         save_folders(config.folders_file, new_folders)
@@ -743,7 +761,7 @@ async def handle_folders_file(room: MatrixRoom, event):
                 except OSError as e:
                     logger.error(f"Не удалось создать папку {path}: {e}")
 
-    await state.delete_pending(room.room_id, event.sender)
+    await state.remove_file_from_queue(room.room_id, event.sender)
 
     msg = "Список папок обновлён."
     if created:
@@ -751,7 +769,7 @@ async def handle_folders_file(room: MatrixRoom, event):
     await send_message(room.room_id, msg)
 
 
-#Фоновые задачи
+# Фоновые задачи
 
 async def orphan_cleanup_loop():
     ###Очистка orphan-файлов
@@ -780,6 +798,7 @@ async def orphan_cleanup_loop():
             break
         except Exception as e:
             logger.error(f"[cleanup] ошибка: {e}", exc_info=True)
+
 
 async def sync_token_saver():
     while True:
@@ -819,10 +838,11 @@ async def invite_checker_loop():
 # Точка входа
 
 async def main():
+    # ВАЖНО: global объявляем в самом начале функции
     global TARGET_FOLDERS
-
-    # Инициализируем кэш папок
     global folders_cache
+    # Инициализируем кэш папок
+
     folders_cache = FoldersCache(state.redis)
 
     # Приоритет загрузки: Redis → файл
