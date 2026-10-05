@@ -83,7 +83,7 @@ def load_config(path: str | None=None) -> Config:
                 ),
                 logging=LoggingConfig(
                     level=os.getenv("LOG_LEVEL", "INFO").upper(),
-                    log_file=os.getenv("LOG_FILE", "bot.log"),
+                    log_file=os.getenv("LOG_FILE", "/app/logs/bot.log"),
                     max_bytes=int(os.getenv("LOG_MAX_BYTES", str(10 * 1024 * 1024))),  # 10 MB
                     backup_count=int(os.getenv("LOG_BACKUP_COUNT", "5"))
                         ),
