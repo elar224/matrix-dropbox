@@ -144,6 +144,27 @@ class StateManager:
     async def close(self):
         await self.redis.aclose()
 
+    async def cleanup_legacy_keys(self):
+            ###Очищает устаревшие ключи от предыдущих версий бота
+            try:
+                # Находим все ключи с префиксом pending:
+                keys_to_delete = []
+                async for key in self.redis.scan_iter(match=f"{REDIS_PREFIX}:*"):
+                    key_type = await self.redis.type(key)
+                    # Если ключ имеет неправильный тип (не list и не string для file/admin_state), удаляем
+                    if key_type == b"string" and ":queue:" in key:
+                        # Это старый ключ очереди типа String, удаляем
+                        keys_to_delete.append(key)
+                    elif key_type not in (b"string", b"list"):
+                        # Неизвестный тип — удаляем
+                        keys_to_delete.append(key)
+
+                if keys_to_delete:
+                    await self.redis.delete(*keys_to_delete)
+                    logger.info(f"Очищено устаревших ключей Redis: {len(keys_to_delete)}")
+            except Exception as e:
+                logger.error(f"Ошибка очистки устаревших ключей: {e}")
+
     def _queue_key(self, room_id: str, user_id: str) -> str:
         return f"{REDIS_PREFIX}:queue:{room_id}:{user_id}"
 
@@ -647,12 +668,13 @@ async def on_room_message(room: MatrixRoom, event):
                 pass
             # Удаляем файл из очереди
             await state.remove_file_from_queue(room.room_id, event.sender)
-
+            clean_smb_path = f"{config.smb.server_ip}/{config.smb.share_name}/{remote_full_path}".replace("//", "/")
             await send_message(
                 room.room_id,
-                f"Файл {final_filename} загружен на SMB-шару: {config.smb.server_ip}/{config.smb.share_name}/{remote_full_path}",
+                f"Файл `{final_filename}` успешно загружен по адресу\n`{clean_smb_path}`",
             )
-            logger.info(f"Файл загружен на SMB: {remote_full_path}")
+
+            logger.info(f"Файл загружен по адресу: {remote_full_path}")
 
             # Проверяем, есть ли ещё файлы в очереди
             next_file = await state.get_next_file(room.room_id, event.sender)
@@ -664,7 +686,7 @@ async def on_room_message(room: MatrixRoom, event):
                 )
                 await send_message(room.room_id, build_menu_text(next_file["filename"]))
         else:
-            await send_message(room.room_id, "Ошибка загрузки файла на SMB-шару.")
+            await send_message(room.room_id, "Ошибка загрузки файла на smb-шару.")
             return
     else:
         # Локальное сохранение
@@ -685,7 +707,7 @@ async def on_room_message(room: MatrixRoom, event):
 
             await send_message(
                 room.room_id,
-                f"Файл {final_filename} сохранён в папку {os.path.basename(folder_path)}:\n{dst_path}",
+                f"Файл `{final_filename}` успешно сохранён по адресу:\n`{dst_path}`",
             )
 
             # Проверяем, есть ли ещё файлы в очереди
@@ -855,12 +877,13 @@ async def invite_checker_loop():
 # Точка входа
 
 async def main():
-    # ВАЖНО: global объявляем в самом начале функции
     global TARGET_FOLDERS
     global folders_cache
     # Инициализируем кэш папок
 
     folders_cache = FoldersCache(state.redis)
+    # Очистка устаревших ключей Redis (добавлено)
+    await state.cleanup_legacy_keys()
 
     # Приоритет загрузки: Redis → файл
     TARGET_FOLDERS = await folders_cache.load()
