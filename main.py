@@ -630,10 +630,16 @@ async def on_room_message(room: MatrixRoom, event):
     if text.lower() == "/cancel":
         deleted_count = await state.clear_queue(room.room_id, event.sender)
         if deleted_count > 0:
-            await send_message(room.room_id, f"Операция отменена. Удалено файлов: {deleted_count}.")
+            await send_message(
+                room.room_id,
+                f"Операция отменена. Удалено файлов из **вашей** очереди: {deleted_count}."
+            )
             logger.info(f"Операция отменена пользователем {event.sender}, удалено {deleted_count} файлов")
         else:
-            await send_message(room.room_id, "Нет активных операций для отмены.")
+            await send_message(
+                room.room_id,
+                "У вас нет активных операций для отмены."
+            )
         return
 
     # Обработка выбора папки
