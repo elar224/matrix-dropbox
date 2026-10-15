@@ -39,13 +39,21 @@ class SMBConfig:
     port: int = 445
 
 @dataclass
+class DropboxConfig:
+    enabled: bool
+    users_file: str
+    bindings_file: str
+    room_name_template: str
+    max_file_mb: int
+
+@dataclass
 class Config:
     db: RedisConfig
     mtrx_bot: MtrxBot
     logging: LoggingConfig
     smb: SMBConfig
     folders_file: str
-
+    dropbox: DropboxConfig
 
 # Создаем экземпляр класса Config и наполняем его данными из переменных окружения
 def load_config(path: str | None=None) -> Config:
@@ -86,8 +94,15 @@ def load_config(path: str | None=None) -> Config:
                     log_file=os.getenv("LOG_FILE", "/app/logs/bot.log"),
                     max_bytes=int(os.getenv("LOG_MAX_BYTES", str(10 * 1024 * 1024))),  # 10 MB
                     backup_count=int(os.getenv("LOG_BACKUP_COUNT", "5"))
-                        ),
-                    folders_file=folders_file,)
+                ),
+                folders_file=folders_file,
+                dropbox=DropboxConfig(
+                    enabled=os.getenv("DROPBOX_ENABLED", "false").lower() in ("true", "1", "yes"),
+                    users_file=os.getenv("DROP_USERS_FILE", "/app/config/drop_users.json"),
+                    bindings_file=os.getenv("DROP_BINDINGS_FILE", "/app/config/personal_rooms.json"),
+                    room_name_template=os.getenv("DROP_ROOM_NAME", "Dropbox — {display_name}"),
+                    max_file_mb=int(os.getenv("DROP_MAX_FILE_MB", "50"))))
+
 ############################################################################################
 ALLOWED_DOCUMENT_MIMETYPES = [
     "application/pdf",
