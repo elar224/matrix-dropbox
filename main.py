@@ -1065,7 +1065,7 @@ async def handle_drop_users_file(room: MatrixRoom, event):
 
     # Перезагрузка whitelist
     if drop_manager is not None:
-        drop_manager.users = load_drop_users(config.dropbox.users_file, config.dropbox.path_template)
+        drop_manager.users = load_drop_users(config.dropbox.users_file)
         await send_message(
             room.room_id,
             f"Список пользователей обновлён. Пользователей: {len(drop_manager.users)}."

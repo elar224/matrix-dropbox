@@ -37,7 +37,7 @@ def _parse_smb_path(path: str) -> tuple[str, str, str]:
     if not path.startswith("smb:/"):
         raise ValueError(f"Неверный формат smb пути: {path}")
 
-    # Убирает префикс smb:/
+    # Убираем префикс smb:/
     rest = path[5:]
     parts = rest.strip("/").split("/", 2)
 
@@ -51,8 +51,10 @@ def _parse_smb_path(path: str) -> tuple[str, str, str]:
     return server, share, relative_path
 
 
-def load_drop_users(path: str, path_template: str) -> dict[str, DropUser]:
-    #Загрузка whitelist пользователей для персонального дропа. Поддерживает форматы: JSON и TSV. Автоматически добавляет MATRIX_DROPBOX к пути.
+def load_drop_users(path: str) -> dict[str, DropUser]:
+    #Загрузка whitelist пользователей для персонального дропа.
+    #Поддерживает форматы: JSON (словарь) и TSV.
+    #Автоматически добавляет MATRIX_DROPBOX к пути.
 
     if not os.path.exists(path):
         logger.warning(f"Файл пользователей не найден: {path}")
@@ -67,28 +69,9 @@ def load_drop_users(path: str, path_template: str) -> dict[str, DropUser]:
 
     result = {}
 
-    # Пробуем JSON
+    # Пробуем распарсить как JSON
     try:
         raw = json.loads(content)
-
-        # Простой список MXID
-        if isinstance(raw, list):
-            for user_id in raw:
-                if not isinstance(user_id, str) or not user_id.startswith("@"):
-                    continue
-                localpart = user_id[1:].split(":")[0]
-                full_path = path_template.format(localpart=localpart, user_id=user_id)
-                server, share, rel_path = _parse_smb_path(full_path)
-                # Добавляем MATRIX_DROPBOX
-                rel_path = os.path.join(rel_path, "MATRIX_DROPBOX") if rel_path else "MATRIX_DROPBOX"
-                result[user_id] = DropUser(
-                    user_id=user_id,
-                    display_name=localpart,
-                    server=server,
-                    share=share,
-                    relative_path=rel_path,
-                )
-            return result
 
         # Словарь MXID -> {display_name, path} или MXID -> path
         if isinstance(raw, dict):
@@ -98,12 +81,15 @@ def load_drop_users(path: str, path_template: str) -> dict[str, DropUser]:
                 localpart = user_id[1:].split(":")[0]
 
                 if isinstance(data, str):
-                    full_path = data if data.startswith("smb:") else path_template.format(localpart=localpart)
+                    full_path = data
                     server, share, rel_path = _parse_smb_path(full_path)
                     rel_path = os.path.join(rel_path, "MATRIX_DROPBOX") if rel_path else "MATRIX_DROPBOX"
                     result[user_id] = DropUser(user_id, localpart, server, share, rel_path)
+
                 elif isinstance(data, dict):
-                    full_path = data.get("path") or path_template.format(localpart=localpart, user_id=user_id)
+                    full_path = data.get("path", "")
+                    if not full_path:
+                        continue
                     server, share, rel_path = _parse_smb_path(full_path)
                     rel_path = os.path.join(rel_path, "MATRIX_DROPBOX") if rel_path else "MATRIX_DROPBOX"
                     result[user_id] = DropUser(
@@ -115,14 +101,14 @@ def load_drop_users(path: str, path_template: str) -> dict[str, DropUser]:
                     )
             return result
 
-        logger.error("Неизвестный формат drop_users.json")
+        logger.error("Неизвестный формат drop_users.json (ожидается словарь)")
         return {}
 
     except json.JSONDecodeError:
-        #  TSV
+        # Если не JSON, пробуем прочитать как TSV
         pass
 
-    # TSV: user_id\tpath
+    # TSV формат: user_id\tpath
     for line in content.strip().split("\n"):
         line = line.strip()
         if not line or line.startswith("#"):
@@ -142,15 +128,23 @@ def load_drop_users(path: str, path_template: str) -> dict[str, DropUser]:
 
         localpart = user_id[1:].split(":")[0]
 
-          # Нормализуем smb:// в smb:/
-        if path.startswith("smb://"):
-            path = "smb:/" + path[6:]
+        try:
+            # Парсим путь на компоненты
+            server, share, rel_path = _parse_smb_path(path)
+        except ValueError as e:
+            logger.warning(f"Пропущена строка (ошибка парсинга пути): {line} — {e}")
+            continue
 
         # Добавляем MATRIX_DROPBOX
-        if not path.endswith("MATRIX_DROPBOX"):
-            path = os.path.join(path, "MATRIX_DROPBOX")
+        rel_path = os.path.join(rel_path, "MATRIX_DROPBOX") if rel_path else "MATRIX_DROPBOX"
 
-        result[user_id] = DropUser(user_id, localpart, path)
+        result[user_id] = DropUser(
+            user_id=user_id,
+            display_name=localpart,
+            server=server,
+            share=share,
+            relative_path=rel_path
+        )
 
     logger.info(f"Загружено пользователей из TSV: {len(result)}")
     return result
@@ -213,7 +207,7 @@ class DropRoomManager:
         self.excluded_rooms = excluded_rooms or set()
 
     async def owner_of(self, room_id: str) -> Optional[str]:
-        #Кому принадлежит комната
+        ##Кому принадлежит комната
         return await self.redis.hget(self.HASH_OWNERS, room_id)
 
     async def room_of(self, user_id: str) -> Optional[str]:
@@ -221,14 +215,14 @@ class DropRoomManager:
         return await self.redis.hget(self.HASH_ROOMS, user_id)
 
     def members_of(self, room_id: str) -> set[str]:
-        #Участники комнаты из кэша синхронизации
+        # Участники комнаты из кэша синхронизации
         room = self.client.rooms.get(room_id)
         if room and room.users:
             return set(room.users.keys())
         return set()
 
     async def _find_existing_dm(self, user_id: str) -> Optional[str]:
-        #Поиск уже существующего приватного диалога с пользователем
+        # Поиск уже существующего приватного диалога с пользователем
         bot_id = self.client.user_id
         for room_id, room in self.client.rooms.items():
             if room_id in self.excluded_rooms:
@@ -239,7 +233,7 @@ class DropRoomManager:
         return None
 
     async def persist(self):
-        #Cохранеybt реестрf привязок в JSON
+        # Сохранение реестра привязок в JSON
         pairs = await self.redis.hgetall(self.HASH_ROOMS)
         tmp = self.bindings_file + ".tmp"
         os.makedirs(os.path.dirname(self.bindings_file) or ".", exist_ok=True)
@@ -249,7 +243,7 @@ class DropRoomManager:
         logger.info(f"Реестр персональных комнат сохранён: {len(pairs)} записей")
 
     async def restore(self):
-        #Восстанавливает Redis из файла если Redis пуст
+        # Восстанавливает Redis из файла если Redis пуст
         if await self.redis.exists(self.HASH_ROOMS):
             logger.info("Реестр персональных комнат уже в Redis")
             return
@@ -272,7 +266,7 @@ class DropRoomManager:
             logger.error(f"Ошибка восстановления реестра: {e}")
 
     async def bind(self, user_id: str, room_id: str) -> Optional[str]:
-        #Привязка существующей комнаты к пользователю
+        # Привязка существующей комнаты к пользователю
         if room_id in self.excluded_rooms:
             logger.warning(f"Попытка привязать служебную комнату как персональную: {room_id}")
             return None
@@ -289,7 +283,7 @@ class DropRoomManager:
         return result
 
     async def get_or_create(self, user_id: str) -> tuple[Optional[str], Optional[str]]:
-        #Возвращает (room_id, error). Создаёт комнату только если её неn
+        #Возвращает (room_id, error). Создаёт комнату только если её нет
         if user_id not in self.users:
             return None, "У вас нет доступа к персональному дропу. Обратитесь к администратору."
 
@@ -399,7 +393,7 @@ class DropRoomManager:
                 await self.redis.delete(lock_key)
 
     async def unbind(self, user_id: str) -> Optional[str]:
-        #Снятие привязки
+        # Снятие привязки
         room_id = await self.room_of(user_id)
         if not room_id:
             return None
@@ -410,7 +404,7 @@ class DropRoomManager:
         return room_id
 
     async def resolve(self, room_id: str, sender: str) -> Optional[RoomTarget]:
-        #Определяет, является ли комната персональной и принадлежит ли она отправителю
+        # Определяет, является ли комната персональной и принадлежит ли она отправителю
         if room_id in self.excluded_rooms:
             return RoomTarget(kind="general", room_id=room_id)
 
