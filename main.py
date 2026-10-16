@@ -813,12 +813,12 @@ async def on_room_message(room: MatrixRoom, event):
         await send_message(room.room_id, "Привязка снята." if old else "Привязка не найдена.")
         return
 
-    # /drop reload - перечитать whitelist
-    if text.lower() == "/drop reload" and drop_manager is not None:
+    # /drop_reload - перечитать whitelist
+    if text.lower() == "/drop_reload" and drop_manager is not None:
         if not is_admin(event.sender):
             await send_message(room.room_id, "У вас нет прав для выполнения этой команды.")
             return
-        drop_manager.users = load_drop_users(config.dropbox.users_file, config.dropbox.path_template)
+        drop_manager.users = load_drop_users(config.dropbox.users_file)
         await send_message(room.room_id, f"Whitelist обновлён. Пользователей: {len(drop_manager.users)}")
         return
 
@@ -1210,7 +1210,7 @@ async def main():
         logger.info(f"Загружено папок из кэша: {len(TARGET_FOLDERS)}")
 
     if config.dropbox.enabled:
-        drop_users = load_drop_users(config.dropbox.users_file, config.dropbox.path_template)
+        drop_users = load_drop_users(config.dropbox.users_file)
         general_rooms = {
             rid for rid in [config.mtrx_bot.mtrx_room_id, config.mtrx_bot.mtrx_room_id_priv] if rid
         }

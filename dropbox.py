@@ -130,23 +130,29 @@ def load_drop_users(path: str, path_template: str) -> dict[str, DropUser]:
 
         parts = line.split("\t")
         if len(parts) < 2:
+            logger.warning(f"Пропущена строка (недостаточно колонок): {line}")
             continue
 
         user_id = parts[0].strip()
         path = parts[1].strip()
 
         if not user_id.startswith("@"):
+            logger.warning(f"Пропущена строка (неверный user_id): {line}")
             continue
 
         localpart = user_id[1:].split(":")[0]
 
-        try:
-            server, share, rel_path = _parse_smb_path(path)
-            rel_path = os.path.join(rel_path, "MATRIX_DROPBOX") if rel_path else "MATRIX_DROPBOX"
-            result[user_id] = DropUser(user_id, localpart, server, share, rel_path)
-        except ValueError as e:
-            logger.warning(f"Пропущена строка в drop_users.json: {e}")
+          # Нормализуем smb:// в smb:/
+        if path.startswith("smb://"):
+            path = "smb:/" + path[6:]
 
+        # Добавляем MATRIX_DROPBOX
+        if not path.endswith("MATRIX_DROPBOX"):
+            path = os.path.join(path, "MATRIX_DROPBOX")
+
+        result[user_id] = DropUser(user_id, localpart, path)
+
+    logger.info(f"Загружено пользователей из TSV: {len(result)}")
     return result
 
 
