@@ -80,7 +80,7 @@
     "path": "smb:/serv2/common/Для Фролова Е.А"
   },
   "@stadnichenko.v:mtrx.npp-elar.tech": {
-    "display_name": "Стадниченко В.В.",
+    "display_name": "Стадниченко В.В",
     "path": "smb:/serv2/common/Для Стадниченко"
   },
   "@a.odintsov:mtrx.npp-elar.tech": {
@@ -90,5 +90,8 @@
   "@e.pozdnyakova:mtrx.npp-elar.tech": {
     "display_name": "Позднякова Е.Ф",
     "path": "smb:/srve1.silar.local/technology/Позднякова Е.Ф"
-  }
-}
+  },
+   "@agp:mtrx.npp-elar.tech": {
+    "display_name": "Попов А. Г.",
+    "path": "smb://serv2/common/Для Попова"
+}}

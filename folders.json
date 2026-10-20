@@ -1,11 +1,11 @@
 {
-  "0": "smb:/Все подряд",
-  "1": "smb:/1086v8.4S-23",
-  "2": "smb:/1086v8.4S-22",
-  "3": "smb:/K1112V1-07",
-  "4": "smb:/1124V1-i4-04",
-  "5": "smb:/K1112V1-08",
-  "6": "smb:/1086v8.4S-24",
-  "7": "smb:/1086v8.4S-25",
-  "8": "smb:/K1112V1-06"
+  "0": "smb://srve1.silar.local/technology/ОБЩАЯ ДЛЯ ТЕХНОЛОГОВ/MATRIX_DROPBOX/Все подряд",
+  "1": "smb://srve1.silar.local/technology/ОБЩАЯ ДЛЯ ТЕХНОЛОГОВ/MATRIX_DROPBOX/1086v8.4S-23",
+  "2": "smb://srve1.silar.local/technology/ОБЩАЯ ДЛЯ ТЕХНОЛОГОВ/MATRIX_DROPBOX/1086v8.4S-22",
+  "3": "smb://srve1.silar.local/technology/ОБЩАЯ ДЛЯ ТЕХНОЛОГОВ/MATRIX_DROPBOX/K1112V1-07",
+  "4": "smb://srve1.silar.local/technology/ОБЩАЯ ДЛЯ ТЕХНОЛОГОВ/MATRIX_DROPBOX/1124V1-i4-04",
+  "5": "smb://srve1.silar.local/technology/ОБЩАЯ ДЛЯ ТЕХНОЛОГОВ/MATRIX_DROPBOX/K1112V1-08",
+  "6": "smb://srve1.silar.local/technology/ОБЩАЯ ДЛЯ ТЕХНОЛОГОВ/MATRIX_DROPBOX/1086v8.4S-24",
+  "7": "smb://srve1.silar.local/technology/ОБЩАЯ ДЛЯ ТЕХНОЛОГОВ/MATRIX_DROPBOX/1086v8.4S-25",
+  "8": "smb://srve1.silar.local/technology/ОБЩАЯ ДЛЯ ТЕХНОЛОГОВ/MATRIX_DROPBOX/K1112V1-06"
 }
