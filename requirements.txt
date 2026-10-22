@@ -1,4 +1,4 @@
-matrix-nio[e2ee]>=0.21.0
+matrix-nio[e2ee]>=0.25.0
 redis>=5.0.0
 python-dotenv>=1.0.0
 aiofiles>=23.0.0

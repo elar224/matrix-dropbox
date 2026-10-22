@@ -348,7 +348,6 @@ class DropRoomManager:
                     f"Внимание: файлы в личной папке автоматически удаляются через {self.retention_days} дн."
                 ),
             })
-
             logger.info(f"Создана персональная комната: {user_id} -> {new_room}")
             return new_room, None, True
         finally:

@@ -43,7 +43,6 @@ class SMBConfig:
     password: str
     port: int = 445
 
-
 @dataclass
 class DropboxConfig:
     enabled: bool
@@ -52,7 +51,6 @@ class DropboxConfig:
     room_name_template: str
     max_file_mb: int
     retention_days: int
-
 
 @dataclass
 class Config:
