@@ -355,6 +355,7 @@ class DropRoomManager:
                 await self.redis.delete(lock_key)
 
     async def resolve(self, room_id: str, sender: str) -> Optional[RoomTarget]:
+
         ###
         #general - одна из двух общих комнат
         #drop    - персональная комната отправителя
