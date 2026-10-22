@@ -117,6 +117,7 @@ ALLOWED_IMAGE_MIMETYPES = [
     "image/png",
     "image/gif",
     "image/webp",
+    "image/bmp",
     "image/heic",
     "image/heif",
 ]

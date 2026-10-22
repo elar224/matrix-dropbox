@@ -17,14 +17,14 @@ class DropUser:
 
 @dataclass
 class RoomTarget:
-    kind: str
+    kind: str  # "general" или "drop"
     room_id: str
     owner: Optional[str] = None
     folder: Optional[str] = None
 
 
 def _normalize_smb_path(path: str) -> str:
-    """Нормализует smb:// в smb:/ и добавляет MATRIX_DROPBOX"""
+     #Нормализует smb:// в smb:/ и добавляет MATRIX_DROPBOX
     if path.startswith("smb://"):
         path = "smb:/" + path[6:]
     if not path.endswith("MATRIX_DROPBOX"):
@@ -33,7 +33,7 @@ def _normalize_smb_path(path: str) -> str:
 
 
 def load_drop_users(path: str) -> dict[str, DropUser]:
-    """Загружает whitelist. Поддерживает JSON и TSV. Добавляет MATRIX_DROPBOX."""
+     #Загружает whitelist. Поддерживает JSON и TSV. Добавляет MATRIX_DROPBOX.
     if not os.path.exists(path):
         logger.warning(f"Файл пользователей не найден: {path}")
         return {}
@@ -47,7 +47,7 @@ def load_drop_users(path: str) -> dict[str, DropUser]:
 
     result = {}
 
-    # 1. Пробуем прочитать как JSON
+    # Пробуем прочитать как JSON
     try:
         raw = json.loads(content)
         if isinstance(raw, dict):
@@ -70,7 +70,7 @@ def load_drop_users(path: str) -> dict[str, DropUser]:
     except json.JSONDecodeError:
         pass  # Переходим к TSV
 
-    # 2. Читаем как TSV (ваш текущий формат)
+    # Читаем как TSV (user_id\tpath)
     for line in content.strip().split("\n"):
         line = line.strip()
         if not line or line.startswith("#"):
@@ -95,7 +95,7 @@ def load_drop_users(path: str) -> dict[str, DropUser]:
 
 
 # Атомарная привязка в двух направлениях
-_BIND_LUA = """
+_BIND_LUA =  """
 local existing_room = redis.call('HGET', KEYS[1], ARGV[1])
 if existing_room then return existing_room end
 local existing_owner = redis.call('HGET', KEYS[2], ARGV[2])
@@ -107,13 +107,20 @@ return ARGV[2]
 
 
 class DropRoomManager:
+     #Управление персональными комнатами и их привязкой к пользователям
     HASH_ROOMS = "drop:rooms"
     HASH_OWNERS = "drop:owners"
     LOCK_PREFIX = "drop:lock:"
-    ROOM_NAME = "Dropbox"  # Единое название для всех личных комнат
 
-    def __init__(self, client, redis_client, users: dict[str, DropUser], bindings_file: str, *,
-                 excluded_rooms: Optional[set[str]] = None):
+    def __init__(
+        self,
+        client,
+        redis_client,
+        users: dict[str, DropUser],
+        bindings_file: str,
+        *,
+        excluded_rooms: Optional[set[str]] = None,
+    ):
         self.client = client
         self.redis = redis_client
         self.users = users
@@ -121,16 +128,20 @@ class DropRoomManager:
         self.excluded_rooms = excluded_rooms or set()
 
     async def owner_of(self, room_id: str) -> Optional[str]:
+         #Кому принадлежит комната
         return await self.redis.hget(self.HASH_OWNERS, room_id)
 
     async def room_of(self, user_id: str) -> Optional[str]:
+         #Комната пользователя
         return await self.redis.hget(self.HASH_ROOMS, user_id)
 
     def members_of(self, room_id: str) -> set[str]:
+         #Участники комнаты из кэша синхронизации
         room = self.client.rooms.get(room_id)
         return set(room.users.keys()) if room and room.users else set()
 
     async def _find_existing_dm(self, user_id: str) -> Optional[str]:
+         #Ищет уже существующий диалог 1:1 с пользователем
         bot_id = self.client.user_id
         for room_id, room in self.client.rooms.items():
             if room_id in self.excluded_rooms:
@@ -140,24 +151,29 @@ class DropRoomManager:
                 return room_id
         return None
 
-    async def _rename_room(self, room_id: str) -> None:
-        """Переименовывает комнату в 'Dropbox'"""
+    async def _rename_room(self, room_id: str, user_id: str) -> None:
+         #Переименовывает комнату в 'Личный Dropbox — {display_name}'
         try:
-            # Небольшая задержка, чтобы клиент Matrix успел полностью инициализировать комнату
             import asyncio
             await asyncio.sleep(0.5)
+
+            display_name = "Пользователь"
+            if user_id in self.users:
+                display_name = self.users[user_id].display_name
+
+            room_name = f"Личный Dropbox — {display_name}"
 
             await self.client.room_put_state(
                 room_id,
                 "m.room.name",
-                {"name": self.ROOM_NAME},
+                {"name": room_name},
             )
-            logger.info(f"УСПЕХ: Комната {room_id} переименована в '{self.ROOM_NAME}'")
+            logger.info(f"Комната {room_id} переименована в '{room_name}'")
         except Exception as e:
-            logger.warning(
-                f"Не удалось переименовать комнату {room_id}: {e}. (Возможно, у бота недостаточно прав или имя уже установлено)")
+            logger.warning(f"Не удалось переименовать комнату {room_id}: {e}")
 
     async def persist(self):
+         #Сохраняет реестр привязок в JSON
         pairs = await self.redis.hgetall(self.HASH_ROOMS)
         tmp = self.bindings_file + ".tmp"
         os.makedirs(os.path.dirname(self.bindings_file) or ".", exist_ok=True)
@@ -166,6 +182,7 @@ class DropRoomManager:
         os.replace(tmp, self.bindings_file)
 
     async def restore(self):
+         #Восстанавливает Redis из файла если Redis пуст
         if await self.redis.exists(self.HASH_ROOMS):
             return
         if not os.path.exists(self.bindings_file):
@@ -182,9 +199,12 @@ class DropRoomManager:
             logger.error(f"Ошибка восстановления реестра: {e}")
 
     async def bind(self, user_id: str, room_id: str) -> Optional[str]:
+         #Привязывает существующую комнату к пользователю
         if room_id in self.excluded_rooms:
             return None
-        result = await self.redis.eval(_BIND_LUA, 2, self.HASH_ROOMS, self.HASH_OWNERS, user_id, room_id)
+        result = await self.redis.eval(
+            _BIND_LUA, 2, self.HASH_ROOMS, self.HASH_OWNERS, user_id, room_id
+        )
         if result:
             await self.persist()
             logger.info(f"Персональная комната привязана: {user_id} -> {room_id}")
@@ -192,33 +212,56 @@ class DropRoomManager:
         return None
 
     async def get_or_create(self, user_id: str) -> tuple[Optional[str], Optional[str]]:
+        # Возвращает (room_id, error). Создаёт комнату только если её нет.
         if user_id not in self.users:
             return None, "У вас нет доступа к персональному дропу."
 
+        # Уже есть привязка
         existing = await self.room_of(user_id)
         if existing and existing in self.client.rooms:
-            await self._rename_room(existing)
+            room = self.client.rooms[existing]
+            members = set(room.users.keys()) if room.users else set()
+            if user_id not in members:
+                try:
+                    await self.client.room_invite(existing, user_id)
+                except Exception as e:
+                    logger.error(f"Ошибка приглашения {user_id} в {existing}: {e}")
+            await self._rename_room(existing, user_id)
             return existing, None
 
+        # Блокировка от параллельных запросов
         lock_key = f"{self.LOCK_PREFIX}{user_id}"
         token = uuid.uuid4().hex
         if not await self.redis.set(lock_key, token, nx=True, ex=30):
             return None, "Комната уже создаётся. Повторите запрос через несколько секунд."
 
         try:
+            # Повторная проверка
             existing = await self.room_of(user_id)
-            if existing:
-                await self._rename_room(existing)
+            if existing and existing in self.client.rooms:
+                await self._rename_room(existing, user_id)
                 return existing, None
 
+            # Ищем существующий личный диалог 1:1
             found = await self._find_existing_dm(user_id)
             if found:
+                room = self.client.rooms[found]
+                members = set(room.users.keys()) if room.users else set()
+                if user_id not in members:
+                    try:
+                        await self.client.room_invite(found, user_id)
+                    except Exception as e:
+                        logger.error(f"Ошибка приглашения {user_id} в {found}: {e}")
+
                 bound = await self.bind(user_id, found)
                 if bound:
-                    await self._rename_room(bound)
+                    await self._rename_room(bound, user_id)
                     return bound, None
 
+            # 4. Создаём новую приватную комнату
             drop_user = self.users[user_id]
+            room_name = f"Личный Dropbox — {drop_user.display_name}"
+
             power_levels = {
                 "users": {self.client.user_id: 100, user_id: 0},
                 "users_default": 0, "events_default": 0, "state_default": 50,
@@ -232,7 +275,7 @@ class DropRoomManager:
             resp = await self.client.room_create(
                 visibility="private",
                 preset="private_chat",
-                room_name=self.ROOM_NAME,
+                room_name=room_name,
                 topic=f"Персональный приёмник файлов. Сохраняется в: {drop_user.smb_path}",
                 invite=[user_id],
                 is_direct=True,
@@ -254,25 +297,46 @@ class DropRoomManager:
             if not bound:
                 return None, "Не удалось закрепить комнату."
 
-            await self._rename_room(bound)
+            await self._rename_room(bound, user_id)
 
             await self.client.room_send(bound, "m.room.message", {
                 "msgtype": "m.text",
-                "body": f"Это ваш персональный Dropbox.\nОтправляйте сюда файлы. Вы сможете выбрать: сохранить их в вашу личную папку или в одну из общих.",
+                "body": (
+                    "Это ваш персональный Dropbox.\n"
+                    "Отправляйте сюда файлы. Вы сможете выбрать: сохранить их в вашу личную папку (*) или в одну из общих."
+                ),
             })
+
+            logger.info(f"Создана персональная комната: {user_id} -> {bound}")
             return bound, None
         finally:
             if await self.redis.get(lock_key) == token:
                 await self.redis.delete(lock_key)
 
+    async def unbind(self, user_id: str) -> Optional[str]:
+         #Снимает привязку
+        room_id = await self.room_of(user_id)
+        if not room_id:
+            return None
+        await self.redis.hdel(self.HASH_ROOMS, user_id)
+        await self.redis.hdel(self.HASH_OWNERS, room_id)
+        await self.persist()
+        logger.info(f"Привязка снята: {user_id}")
+        return room_id
+
     async def resolve(self, room_id: str, sender: str) -> Optional[RoomTarget]:
+        # Определяет, является ли комната персональной и принадлежит ли она отправителю
         if room_id in self.excluded_rooms:
             return RoomTarget(kind="general", room_id=room_id)
+
         owner = await self.owner_of(room_id)
         if owner:
             if sender != owner or owner not in self.users:
                 return None
             return RoomTarget(kind="drop", room_id=room_id, owner=owner, folder=self.users[owner].smb_path)
+
+        # Если комната не зарегистрирована, но отправитель в whitelist, разрешаем команды
         if sender in self.users:
             return RoomTarget(kind="general", room_id=room_id)
+
         return None
