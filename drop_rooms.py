@@ -28,7 +28,7 @@ class RoomTarget:
 
 
 def _normalize_smb_path(path: str) -> str:
-    ###smb://x -> smb:/x и гарантирует ровно один суффикс /MATRIX_DROPBOX
+    """smb://x -> smb:/x и гарантирует ровно один суффикс /MATRIX_DROPBOX."""
     path = path.strip().replace("\\", "/")
     if path.startswith("smb://"):
         path = "smb:/" + path[6:]
@@ -62,7 +62,7 @@ def _make_user(user_id, data) -> Optional[DropUser]:
 
 
 def parse_drop_users(content: str) -> dict[str, DropUser]:
-    ###Разбирает JSON или TSV. Невалидные записи пропускаются; пустой результат = ошибка на стороне вызывающего
+    """Разбирает JSON или TSV. Невалидные записи пропускаются; пустой результат = ошибка на стороне вызывающего."""
     result: dict[str, DropUser] = {}
 
     try:
@@ -98,7 +98,7 @@ def parse_drop_users(content: str) -> dict[str, DropUser]:
 
 
 def load_drop_users(path: str) -> Optional[dict[str, DropUser]]:
-    ###None - файл не найден или не читается. Иначе словарь (возможно пустой).
+    """None - файл не найден или не читается. Иначе словарь (возможно пустой)."""
     if not os.path.exists(path):
         logger.warning(f"Файл пользователей не найден: {path}")
         return None
@@ -114,7 +114,7 @@ def load_drop_users(path: str) -> Optional[dict[str, DropUser]]:
 
 
 def save_drop_users_atomic(path: str, data: bytes) -> None:
-    ###Атомарная запись с резервной копией .bak.
+    """Атомарная запись с резервной копией .bak."""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     if os.path.exists(path):
         shutil.copy2(path, path + ".bak")
@@ -142,7 +142,7 @@ return ARGV[2]
 
 
 class DropRoomManager:
-    ##Управление персональными комнатами и их привязкой к пользователям
+    """Управление персональными комнатами и их привязкой к пользователям."""
     HASH_ROOMS = "drop:rooms"
     HASH_OWNERS = "drop:owners"
     LOCK_PREFIX = "drop:lock:"
@@ -217,7 +217,7 @@ class DropRoomManager:
         os.replace(tmp, self.bindings_file)
 
     async def restore(self):
-        ##Восстанавливает Redis из файла, если Redis пуст
+        """Восстанавливает Redis из файла, если Redis пуст."""
         if await self.redis.exists(self.HASH_ROOMS):
             return
         if not os.path.exists(self.bindings_file):
@@ -234,7 +234,7 @@ class DropRoomManager:
             logger.error(f"Ошибка восстановления реестра: {e}")
 
     async def bind(self, user_id: str, room_id: str) -> Optional[str]:
-        ##Возвращает room_id только если пользователь теперь привязан именно к ЭТОЙ комнате
+        """Возвращает room_id только если пользователь теперь привязан именно к ЭТОЙ комнате."""
         if room_id in self.excluded_rooms:
             return None
         result = await self.redis.eval(
@@ -257,7 +257,7 @@ class DropRoomManager:
         return room_id
 
     async def _find_existing_dm(self, user_id: str) -> Optional[str]:
-        ##Ищет существующий диалог 1:1 бота и пользователя (не занятый и не общий)
+        """Ищет существующий диалог 1:1 бота и пользователя (не занятый и не общий)."""
         bot_id = self.client.user_id
         for room_id, room in self.client.rooms.items():
             if room_id in self.excluded_rooms:
@@ -271,7 +271,7 @@ class DropRoomManager:
         return None
 
     async def get_or_create(self, user_id: str) -> tuple[Optional[str], Optional[str], bool]:
-        ###Возвращает (room_id, error, created)
+        """Возвращает (room_id, error, created)."""
         if user_id not in self.users:
             return None, "У вас нет доступа к персональному дропу.", False
 
@@ -348,6 +348,7 @@ class DropRoomManager:
                     f"Внимание: файлы в личной папке автоматически удаляются через {self.retention_days} дн."
                 ),
             })
+
             logger.info(f"Создана персональная комната: {user_id} -> {new_room}")
             return new_room, None, True
         finally:
@@ -355,12 +356,11 @@ class DropRoomManager:
                 await self.redis.delete(lock_key)
 
     async def resolve(self, room_id: str, sender: str) -> Optional[RoomTarget]:
-
-        ###
-        #general - одна из двух общих комнат
-        #drop    - персональная комната отправителя
-        #other   - неприявязанная комната, где пишет вайтлист-пользователь (только команды, без загрузки файлов)
-
+        """
+        general - одна из двух общих комнат
+        drop    - персональная комната отправителя
+        other   - неприявязанная комната, где пишет вайтлист-пользователь (только команды, без загрузки файлов)
+        """
         if room_id in self.excluded_rooms:
             return RoomTarget(kind="general", room_id=room_id)
 

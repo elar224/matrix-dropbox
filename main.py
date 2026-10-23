@@ -1,80 +1,84 @@
 import asyncio
+import errno
+import hashlib
 import io
 import json
 import logging
 import logging.handlers
 import os
 import shutil
+import stat as stat_lib
 import time
 from datetime import datetime
+from functools import wraps
 from typing import Optional
 
-from dropbox import DropRoomManager, load_drop_users, RoomTarget
 import nio
-from nio import (
-    AsyncClient,
-    MatrixRoom,
-    RoomMessageText,
-    RoomMessageFile,
-    RoomMessageImage,
-)
+from nio import AsyncClient, MatrixRoom, RoomMessageText, RoomMessageFile, RoomMessageImage
 import redis.asyncio as redis
 
 try:
-    from smbclient import open_file, register_session, mkdir as smb_mkdir, stat as smb_stat
-    from smbprotocol.exceptions import SMBException
+    from smbclient import (
+        open_file,
+        register_session,
+        mkdir as smb_mkdir,
+        stat as smb_stat,
+        listdir as smb_listdir,
+        remove as smb_remove,
+    )
     SMB_AVAILABLE = True
 except ImportError:
     SMB_AVAILABLE = False
 
-from config import load_config, load_folders, save_folders, ALLOWED_MIMETYPES
+from config import (
+    ConfigError,
+    load_config,
+    load_folders,
+    save_folders,
+    validate_folders,
+    ALLOWED_MIMETYPES,
+)
+from drop_rooms import (
+    DropRoomManager,
+    RoomTarget,
+    load_drop_users,
+    parse_drop_users,
+    save_drop_users_atomic,
+)
 
-
-# Конфиги
-
-config = load_config()
+try:
+    config = load_config()
+except ConfigError as e:
+    raise SystemExit(f"Ошибка конфигурации: {e}")
 
 DOWNLOAD_DIR = "/app/tmp_downloads"
-SYNC_TOKEN_FILE = "/app/data/sync_token"
 STATE_TTL_SECONDS = 3600
 REDIS_PREFIX = "pending"
 EVENT_MAX_AGE_SECONDS = 60
-TARGET_FOLDERS: dict[str, str] = {}
+SMB_UPLOAD_TIMEOUT = 120.0
+ORPHAN_MIN_AGE_SECONDS = 900
+MAX_FILE_BYTES = config.dropbox.max_file_mb * 1024 * 1024
 
-drop_manager: Optional["DropRoomManager"] = None
-drop_locks: dict[str, asyncio.Lock] = {}
+TARGET_FOLDERS: dict[str, str] = {}
+drop_manager: Optional[DropRoomManager] = None
 folders_cache: Optional["FoldersCache"] = None
 
-
-def _parse_smb_path(path: str) -> tuple[str, str, str]:
-    # Разбирает smb путь на (server, share, relative_path)
-    if path.startswith("smb://"):
-        path = "smb:/" + path[6:]
-    if not path.startswith("smb:/"):
-        raise ValueError(f"Неверный формат smb пути: {path}")
-    rest = path[5:]
-    parts = rest.strip("/").split("/", 2)
-    if len(parts) < 2:
-        raise ValueError(f"Неверный формат smb пути: {path}")
-    return parts[0], parts[1], parts[2] if len(parts) > 2 else ""
+_user_locks: dict[tuple[str, str], asyncio.Lock] = {}
+_background: set[asyncio.Task] = set()
 
 
-
-# Логирование
+# ---------------------------------------------------------------- логирование
 
 def setup_logging() -> logging.Logger:
     logger = logging.getLogger("matrix_bot")
     logger.setLevel(getattr(logging, config.logging.level, logging.INFO))
-
     formatter = logging.Formatter(
         fmt="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
-
     try:
         os.makedirs(os.path.dirname(config.logging.log_file) or ".", exist_ok=True)
         file_handler = logging.handlers.RotatingFileHandler(
@@ -87,19 +91,88 @@ def setup_logging() -> logging.Logger:
         logger.addHandler(file_handler)
     except OSError as e:
         logger.warning(f"Не удалось создать файл логов: {e}")
-
-    logging.getLogger("nio").setLevel(logging.WARNING)
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("httpcore").setLevel(logging.WARNING)
-    logging.getLogger("smbprotocol").setLevel(logging.WARNING)
-
+    for name in ("nio", "httpx", "httpcore", "smbprotocol"):
+        logging.getLogger(name).setLevel(logging.WARNING)
     return logger
 
 
 logger = setup_logging()
 
 
-# Кэш папок в FSM
+# ---------------------------------------------------------------- утилиты
+
+def _parse_smb_path(path: str) -> tuple[str, str, str]:
+    """smb:/server/share/rel/path -> (server, share, rel/path)"""
+    if path.startswith("smb://"):
+        path = "smb:/" + path[6:]
+    if not path.startswith("smb:/"):
+        raise ValueError(f"Неверный формат smb пути: {path}")
+    parts = path[5:].strip("/").split("/", 2)
+    if len(parts) < 2:
+        raise ValueError(f"Неверный формат smb пути: {path}")
+    return parts[0], parts[1], parts[2] if len(parts) > 2 else ""
+
+
+def is_smb_path(path: str) -> bool:
+    return path.startswith("smb:/")
+
+
+def sanitize_filename(name: str) -> str:
+    """Оставляет только безопасное имя файла (без путей и запрещённых символов)."""
+    name = (name or "").replace("\\", "/").split("/")[-1]
+    name = "".join(c for c in name if c not in '<>:"|?*' and ord(c) >= 32)
+    name = name.strip(" .")
+    if len(name) > 150:
+        root, ext = os.path.splitext(name)
+        if len(ext) > 20:
+            root, ext = name, ""
+        name = root[:150 - len(ext)] + ext
+    return name or "unnamed_file"
+
+
+def strip_reply_fallback(body: str) -> str:
+    """Убирает цитату ('> ...') из ответа в Element, чтобы выбор цифры работал."""
+    lines = body.split("\n")
+    i = 0
+    while i < len(lines) and lines[i].startswith(">"):
+        i += 1
+    if i:
+        while i < len(lines) and not lines[i].strip():
+            i += 1
+    return "\n".join(lines[i:]).strip()
+
+
+def get_lock(room_id: str, user_id: str) -> asyncio.Lock:
+    return _user_locks.setdefault((room_id, user_id), asyncio.Lock())
+
+
+def spawn(coro, name: str):
+    async def _guard():
+        try:
+            await coro
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(f"Ошибка в фоновой задаче {name}")
+
+    task = asyncio.create_task(_guard())
+    _background.add(task)
+    task.add_done_callback(_background.discard)
+
+
+def safe(handler):
+    @wraps(handler)
+    async def wrapper(room, event):
+        try:
+            await handler(room, event)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(f"Ошибка в обработчике {handler.__name__}")
+    return wrapper
+
+
+# ---------------------------------------------------------------- кэш папок
 
 class FoldersCache:
     CACHE_KEY = "bot:folders"
@@ -113,61 +186,48 @@ class FoldersCache:
             raw = await self.redis.get(self.CACHE_KEY)
             if not raw:
                 return None
-            data = json.loads(raw)
-            if not isinstance(data, dict):
-                logger.warning("Кэш folders в Redis имеет неверный формат")
-                return None
+            data = validate_folders(json.loads(raw))
             logger.info(f"Список папок загружен из Redis-кэша ({len(data)} папок)")
             return data
-        except (json.JSONDecodeError, Exception) as e:
+        except Exception as e:
             logger.error(f"Ошибка загрузки кэша folders из Redis: {e}")
             return None
 
     async def save(self, folders: dict[str, str]) -> bool:
         try:
             await self.redis.set(
-                self.CACHE_KEY,
-                json.dumps(folders, ensure_ascii=False),
-                ex=self.CACHE_TTL,
+                self.CACHE_KEY, json.dumps(folders, ensure_ascii=False), ex=self.CACHE_TTL
             )
-            logger.info(f"Список папок сохранён в Redis-кэш ({len(folders)} папок)")
             return True
         except Exception as e:
             logger.error(f"Ошибка сохранения кэша folders в Redis: {e}")
             return False
 
-    async def clear(self) -> bool:
-        try:
-            await self.redis.delete(self.CACHE_KEY)
-            logger.info("Кэш folders очищен")
-            return True
-        except Exception as e:
-            logger.error(f"Ошибка очистки кэша folders: {e}")
-            return False
 
+# ---------------------------------------------------------------- FSM на Redis
 
-# ============================================================
-# FSM на Redis
-# ============================================================
 class StateManager:
     def __init__(self):
-        redis_url = f"redis://{config.db.host}:{config.db.port}"
-        if config.db.password:
-            redis_url += f"?password={config.db.password}"
-        self.redis = redis.from_url(redis_url, decode_responses=True)
-        logger.info(f"Redis подключён: {config.db.host}:{config.db.port}")
+        self.redis = redis.Redis(
+            host=config.db.host,
+            port=config.db.port,
+            password=config.db.password or None,
+            decode_responses=True,
+        )
+        logger.info(f"Redis: {config.db.host}:{config.db.port}")
 
     async def close(self):
         await self.redis.aclose()
 
     async def cleanup_legacy_keys(self):
+        """Удаляет только ключи старого формата (decode_responses=True -> type() возвращает str)."""
         try:
             keys_to_delete = []
             async for key in self.redis.scan_iter(match=f"{REDIS_PREFIX}:*"):
                 key_type = await self.redis.type(key)
-                if key_type == b"string" and ":queue:" in key:
+                if key_type == "string" and ":queue:" in key:
                     keys_to_delete.append(key)
-                elif key_type not in (b"string", b"list"):
+                elif key_type not in ("string", "list"):
                     keys_to_delete.append(key)
             if keys_to_delete:
                 await self.redis.delete(*keys_to_delete)
@@ -175,115 +235,111 @@ class StateManager:
         except Exception as e:
             logger.error(f"Ошибка очистки устаревших ключей: {e}")
 
-    def _queue_key(self, room_id: str, user_id: str) -> str:
+    def _queue_key(self, room_id, user_id):
         return f"{REDIS_PREFIX}:queue:{room_id}:{user_id}"
 
-    def _admin_state_key(self, room_id: str, user_id: str) -> str:
+    def _admin_state_key(self, room_id, user_id):
         return f"{REDIS_PREFIX}:admin_state:{room_id}:{user_id}"
 
-    def _file_key(self, event_id: str) -> str:
+    def _file_key(self, event_id):
         return f"{REDIS_PREFIX}:file:{event_id}"
 
-    async def add_file_to_queue(
-        self, room_id: str, user_id: str, event_id: str, temp_path: str, filename: str
-    ):
+    async def mark_seen(self, event_id: str) -> bool:
+        """True, если событие видим впервые (защита от повторной обработки после рестарта)."""
+        return bool(await self.redis.set(f"{REDIS_PREFIX}:seen:{event_id}", "1", nx=True, ex=300))
+
+    async def add_file_to_queue(self, room_id, user_id, event_id, temp_path, filename) -> int:
+        """Возвращает позицию файла в очереди (атомарно, из RPUSH)."""
         file_data = {
             "event_id": event_id,
             "temp_path": temp_path,
             "filename": filename,
             "created_at": time.time(),
         }
-        await self.redis.set(
-            self._file_key(event_id),
-            json.dumps(file_data),
-            ex=STATE_TTL_SECONDS,
-        )
-        await self.redis.rpush(self._queue_key(room_id, user_id), event_id)
+        await self.redis.set(self._file_key(event_id), json.dumps(file_data), ex=STATE_TTL_SECONDS)
+        position = await self.redis.rpush(self._queue_key(room_id, user_id), event_id)
         await self.redis.expire(self._queue_key(room_id, user_id), STATE_TTL_SECONDS)
-        logger.debug(f"Файл добавлен в очередь: event_id={event_id}, user={user_id}")
+        return position
 
-    async def get_next_file(self, room_id: str, user_id: str) -> Optional[dict]:
+    async def get_next_file(self, room_id, user_id) -> Optional[dict]:
         queue_key = self._queue_key(room_id, user_id)
-        event_id = await self.redis.lindex(queue_key, 0)
+        while True:
+            event_id = await self.redis.lindex(queue_key, 0)
+            if not event_id:
+                return None
+            raw = await self.redis.get(self._file_key(event_id))
+            if raw:
+                return json.loads(raw)
+            await self.redis.lpop(queue_key)  # просроченная запись - пропускаем
+
+    async def remove_file_from_queue(self, room_id, user_id) -> Optional[dict]:
+        event_id = await self.redis.lpop(self._queue_key(room_id, user_id))
         if not event_id:
             return None
-        file_data_raw = await self.redis.get(self._file_key(event_id))
-        if not file_data_raw:
-            await self.redis.lpop(queue_key)
-            return None
-        return json.loads(file_data_raw)
-
-    async def remove_file_from_queue(self, room_id: str, user_id: str) -> Optional[dict]:
-        queue_key = self._queue_key(room_id, user_id)
-        event_id = await self.redis.lpop(queue_key)
-        if not event_id:
-            return None
-        file_data_raw = await self.redis.get(self._file_key(event_id))
+        raw = await self.redis.get(self._file_key(event_id))
         await self.redis.delete(self._file_key(event_id))
-        return json.loads(file_data_raw) if file_data_raw else None
+        return json.loads(raw) if raw else None
 
-    async def get_queue_length(self, room_id: str, user_id: str) -> int:
-        return await self.redis.llen(self._queue_key(room_id, user_id))
-
-    async def clear_queue(self, room_id: str, user_id: str) -> int:
+    async def get_queue_length(self, room_id, user_id) -> int:
+        """Считает только живые записи, мёртвые убирает."""
         queue_key = self._queue_key(room_id, user_id)
-        event_ids = await self.redis.lrange(queue_key, 0, -1)
-        deleted_count = 0
-        for event_id in event_ids:
+        alive = 0
+        for event_id in await self.redis.lrange(queue_key, 0, -1):
+            if await self.redis.exists(self._file_key(event_id)):
+                alive += 1
+            else:
+                await self.redis.lrem(queue_key, 0, event_id)
+        return alive
+
+    async def clear_queue(self, room_id, user_id) -> tuple[int, bool]:
+        """Возвращает (удалено файлов, было ли состояние ожидания админа)."""
+        queue_key = self._queue_key(room_id, user_id)
+        deleted = 0
+        for event_id in await self.redis.lrange(queue_key, 0, -1):
             file_key = self._file_key(event_id)
-            file_data_raw = await self.redis.get(file_key)
-            if file_data_raw:
-                file_data = json.loads(file_data_raw)
-                temp_path = file_data.get("temp_path")
+            raw = await self.redis.get(file_key)
+            if raw:
+                temp_path = json.loads(raw).get("temp_path")
                 if temp_path and os.path.exists(temp_path):
                     try:
                         os.remove(temp_path)
-                        deleted_count += 1
+                        deleted += 1
                     except OSError:
                         pass
             await self.redis.delete(file_key)
         await self.redis.delete(queue_key)
-        await self.redis.delete(self._admin_state_key(room_id, user_id))
-        return deleted_count
+        had_state = bool(await self.redis.delete(self._admin_state_key(room_id, user_id)))
+        return deleted, had_state
 
-    async def set_awaiting_folders(self, room_id: str, user_id: str):
-        data = {"state": "awaiting_folders", "created_at": time.time()}
+    async def _set_admin_state(self, room_id, user_id, name):
         await self.redis.set(
             self._admin_state_key(room_id, user_id),
-            json.dumps(data),
+            json.dumps({"state": name, "created_at": time.time()}),
             ex=STATE_TTL_SECONDS,
         )
 
-    async def is_awaiting_folders(self, room_id: str, user_id: str) -> bool:
+    async def _is_admin_state(self, room_id, user_id, name) -> bool:
         raw = await self.redis.get(self._admin_state_key(room_id, user_id))
-        if raw:
-            try:
-                return json.loads(raw).get("state") == "awaiting_folders"
-            except json.JSONDecodeError:
-                return False
-        return False
+        if not raw:
+            return False
+        try:
+            return json.loads(raw).get("state") == name
+        except json.JSONDecodeError:
+            return False
 
-    async def clear_awaiting_folders(self, room_id: str, user_id: str):
-        await self.redis.delete(self._admin_state_key(room_id, user_id))
+    async def set_awaiting_folders(self, room_id, user_id):
+        await self._set_admin_state(room_id, user_id, "awaiting_folders")
 
-    async def set_awaiting_drop_users(self, room_id: str, user_id: str):
-        data = {"state": "awaiting_drop_users", "created_at": time.time()}
-        await self.redis.set(
-            self._admin_state_key(room_id, user_id),
-            json.dumps(data),
-            ex=STATE_TTL_SECONDS,
-        )
+    async def is_awaiting_folders(self, room_id, user_id) -> bool:
+        return await self._is_admin_state(room_id, user_id, "awaiting_folders")
 
-    async def is_awaiting_drop_users(self, room_id: str, user_id: str) -> bool:
-        raw = await self.redis.get(self._admin_state_key(room_id, user_id))
-        if raw:
-            try:
-                return json.loads(raw).get("state") == "awaiting_drop_users"
-            except json.JSONDecodeError:
-                return False
-        return False
+    async def set_awaiting_drop_users(self, room_id, user_id):
+        await self._set_admin_state(room_id, user_id, "awaiting_drop_users")
 
-    async def clear_awaiting_drop_users(self, room_id: str, user_id: str):
+    async def is_awaiting_drop_users(self, room_id, user_id) -> bool:
+        return await self._is_admin_state(room_id, user_id, "awaiting_drop_users")
+
+    async def clear_admin_state(self, room_id, user_id):
         await self.redis.delete(self._admin_state_key(room_id, user_id))
 
     async def iter_all_files(self):
@@ -293,125 +349,130 @@ class StateManager:
                 yield key, json.loads(raw)
 
 
-
-# smb-клиент с поддержкой разных серверов
+# ---------------------------------------------------------------- SMB
 
 class SMBClient:
     def __init__(self):
-        self._registered_servers = set()
+        self._registered: set[str] = set()
 
-    async def register_server(self, server: str, username: str, password: str, port: int = 445) -> bool:
+    async def register_server(self, server: str) -> bool:
         if not SMB_AVAILABLE:
             logger.error("smbprotocol не установлен.")
             return False
-        if server in self._registered_servers:
+        if server in self._registered:
             return True
         try:
             await asyncio.to_thread(
-                register_session,
-                server,
-                username,
-                password,
-                port=port,
+                register_session, server,
+                username=config.smb.username, password=config.smb.password, port=config.smb.port,
             )
-            self._registered_servers.add(server)
-            logger.info(f"smb-сессия зарегистрирована для сервера: {server}")
+            self._registered.add(server)
+            logger.info(f"smb-сессия зарегистрирована: {server}")
             return True
         except Exception as e:
             logger.error(f"Ошибка регистрации smb-сессии для {server}: {e}")
             return False
 
-    def _unc_path(self, server: str, share: str, relative_path: str) -> str:
-        relative_path = relative_path.strip("/").replace("/", os.sep)
-        if relative_path:
-            return f"\\\\{server}\\{share}\\{relative_path}"
-        return f"\\\\{server}\\{share}"
+    @staticmethod
+    def _unc_path(server: str, share: str, relative_path: str) -> str:
+        relative = relative_path.strip("/").replace("/", "\\")
+        base = f"\\\\{server}\\{share}"
+        return f"{base}\\{relative}" if relative else base
+
+    async def _exists(self, unc: str) -> bool:
+        try:
+            await asyncio.to_thread(smb_stat, unc)
+            return True
+        except OSError as e:
+            if e.errno == errno.ENOENT:
+                return False
+            raise
 
     async def ensure_dir(self, server: str, share: str, relative_path: str) -> bool:
-        if not await self.register_server(server, config.smb.username, config.smb.password, config.smb.port):
+        if not await self.register_server(server):
             return False
-        parts = relative_path.strip("/").split("/") if relative_path.strip("/") else []
         current = ""
-        try:
-            for part in parts:
-                current = f"{current}/{part}" if current else part
-                unc = self._unc_path(server, share, current)
-                try:
-                    await asyncio.to_thread(smb_stat, unc)
-                except Exception:
-                    try:
-                        await asyncio.to_thread(smb_mkdir, unc)
-                        logger.info(f"Создана smb-директория: {unc}")
-                    except Exception as e:
-                        logger.error(f"Не удалось создать smb-директорию {unc}: {e}")
-                        return False
-            return True
-        except Exception as e:
-            logger.error(f"Ошибка ensure_dir: {e}")
-            return False
+        for part in [p for p in relative_path.strip("/").split("/") if p]:
+            current = f"{current}/{part}" if current else part
+            unc = self._unc_path(server, share, current)
+            try:
+                if await self._exists(unc):
+                    continue
+                await asyncio.to_thread(smb_mkdir, unc)
+                logger.info(f"Создана smb-директория: {unc}")
+            except Exception as e:
+                logger.error(f"Не удалось создать/проверить smb-директорию {unc}: {e}")
+                self._registered.discard(server)
+                return False
+        return True
 
-    async def upload_file(self, server: str, share: str, relative_path: str, local_path: str) -> bool:
-        if not await self.register_server(server, config.smb.username, config.smb.password, config.smb.port):
-            return False
-        unc = self._unc_path(server, share, relative_path)
+    async def upload_file(self, server: str, share: str, relative_path: str, local_path: str) -> Optional[str]:
+        """Возвращает итоговый относительный путь (с учётом переименования при коллизии) или None."""
+        if not await self.register_server(server):
+            return None
+        rel_dir, _, name = relative_path.rpartition("/")
+        if rel_dir and not await self.ensure_dir(server, share, rel_dir):
+            return None
+
         try:
-            with open(local_path, "rb") as src:
-                data = src.read()
+            final_rel = relative_path
+            unc = self._unc_path(server, share, final_rel)
+            if await self._exists(unc):
+                root, ext = os.path.splitext(name)
+                name = f"{root}_{datetime.now().strftime('%Y%m%d_%H%M%S')}{ext}"
+                final_rel = f"{rel_dir}/{name}" if rel_dir else name
+                unc = self._unc_path(server, share, final_rel)
 
             def _write():
-                with open_file(unc, mode="wb") as dst:
-                    dst.write(data)
+                with open(local_path, "rb") as src, open_file(unc, mode="wb") as dst:
+                    shutil.copyfileobj(src, dst, 1024 * 1024)
 
-            await asyncio.wait_for(asyncio.to_thread(_write), timeout=30.0)
+            await asyncio.wait_for(asyncio.to_thread(_write), timeout=SMB_UPLOAD_TIMEOUT)
             logger.info(f"Файл загружен на smb: {local_path} -> {unc}")
-            return True
+            return final_rel
         except asyncio.TimeoutError:
-            logger.error(f"ТАЙМАУТ загрузки на smb (30 сек): {unc}. Проверьте права доступа к папке.")
-            self._registered_servers.discard(server)
-            return False
+            logger.error(f"ТАЙМАУТ загрузки на smb ({SMB_UPLOAD_TIMEOUT:.0f} сек). Проверьте права доступа.")
         except Exception as e:
             logger.error(f"Ошибка загрузки на smb: {e}")
-            self._registered_servers.discard(server)
-            return False
+        self._registered.discard(server)
+        return None
 
     async def delete_old_files(self, server: str, share: str, relative_path: str, max_age_days: int) -> int:
-        if not await self.register_server(server, config.smb.username, config.smb.password, config.smb.port):
+        if not await self.register_server(server):
             return 0
         unc = self._unc_path(server, share, relative_path)
-        deleted_count = 0
-        cutoff_time = time.time() - (max_age_days * 24 * 3600)
+        cutoff = time.time() - max_age_days * 24 * 3600
+        deleted = 0
         try:
-            from smbclient import listdir, remove
-            entries = await asyncio.to_thread(listdir, unc)
-            for entry in entries:
+            for entry in await asyncio.to_thread(smb_listdir, unc):
                 entry_unc = f"{unc}\\{entry}"
                 try:
-                    stat_info = await asyncio.to_thread(smb_stat, entry_unc)
-                    if hasattr(stat_info, 'st_mode') and not (stat_info.st_mode & 0o170000 == 0o040000):
-                        mtime = getattr(stat_info, 'st_mtime', 0)
-                        if mtime < cutoff_time:
-                            try:
-                                await asyncio.to_thread(remove, entry_unc)
-                                deleted_count += 1
-                                logger.info(f"[cleanup] Удалён старый файл: {entry_unc}")
-                            except Exception as e:
-                                logger.error(f"Не удалось удалить файл {entry_unc}: {e}")
+                    st = await asyncio.to_thread(smb_stat, entry_unc)
+                    if stat_lib.S_ISDIR(st.st_mode):
+                        continue
+                    if st.st_mtime < cutoff:
+                        await asyncio.to_thread(smb_remove, entry_unc)
+                        deleted += 1
+                        logger.info(f"[cleanup] Удалён старый файл: {entry_unc}")
+                except FileNotFoundError:
+                    continue
                 except Exception as e:
-                    logger.debug(f"Не удалось получить статистику для {entry_unc}: {e}")
-            return deleted_count
+                    logger.error(f"[cleanup] {entry_unc}: {e}")
         except Exception as e:
             logger.error(f"Ошибка удаления старых файлов в {unc}: {e}")
-            return 0
+        return deleted
 
 
 smb_client = SMBClient()
-
-
-# Клиент Matrix и вспомогательные функции
-
-client = AsyncClient(config.mtrx_bot.mtrx_url)
+client = AsyncClient(
+    config.mtrx_bot.mtrx_url,
+    user=config.mtrx_bot.mtrx_user_id,
+    device_id=config.mtrx_bot.mtrx_dev_id or "",
+)
 state = StateManager()
 
+
+# ---------------------------------------------------------------- Matrix helpers
 
 def is_admin(user_id: str) -> bool:
     return user_id in config.mtrx_bot.admin_users
@@ -424,39 +485,25 @@ def is_event_too_old(event) -> bool:
 
 async def send_message(room_id: str, text: str):
     try:
-        await client.room_send(room_id, "m.room.message", {
-            "msgtype": "m.text",
-            "body": text,
-        })
+        await client.room_send(room_id, "m.room.message", {"msgtype": "m.text", "body": text})
     except Exception as e:
         logger.error(f"Ошибка отправки сообщения в {room_id}: {e}")
 
 
-async def send_file(room_id: str, filename: str, content: bytes, mimetype: str = "text/plain"):
+async def send_file(room_id: str, filename: str, content: bytes, mimetype: str = "text/plain") -> bool:
     try:
-        buffer = io.BytesIO(content)
         upload_response = await client.upload(
-            buffer,
-            filename=filename,
-            content_type=mimetype,
-            filesize=len(content),
+            io.BytesIO(content), content_type=mimetype, filename=filename, filesize=len(content)
         )
+        if isinstance(upload_response, tuple):
+            upload_response = upload_response[0]
         if isinstance(upload_response, nio.UploadError):
             logger.error(f"Ошибка загрузки файла: {upload_response.message}")
             return False
-
-        if isinstance(upload_response, tuple):
-            content_uri = str(upload_response[0].content_uri)
-        elif hasattr(upload_response, 'content_uri'):
-            content_uri = str(upload_response.content_uri)
-        else:
-            logger.error(f"Неизвестный тип upload_response: {type(upload_response)}")
-            return False
-
         await client.room_send(room_id, "m.room.message", {
             "msgtype": "m.file",
             "body": filename,
-            "url": content_uri,
+            "url": str(upload_response.content_uri),
             "info": {"mimetype": mimetype, "size": len(content)},
         })
         return True
@@ -465,575 +512,511 @@ async def send_file(room_id: str, filename: str, content: bytes, mimetype: str =
         return False
 
 
+async def download_media(mxc_url: str) -> Optional[bytes]:
+    try:
+        response = await client.download(mxc=mxc_url)
+    except Exception as e:
+        logger.error(f"Ошибка скачивания {mxc_url}: {e}")
+        return None
+    if isinstance(response, nio.DownloadError):
+        logger.error(f"DownloadError: {response.message}")
+        return None
+    return response.body
+
+
 def is_allowed_room(room_id: str) -> bool:
-    allowed_rooms = [
-        rid for rid in [config.mtrx_bot.mtrx_room_id, config.mtrx_bot.mtrx_room_id_priv]
-        if rid
-    ]
-    is_allowed = room_id in allowed_rooms
-    if not is_allowed:
-        logger.warning(f"Комната {room_id} не в списке разрешённых: {allowed_rooms}")
-    return is_allowed
+    allowed = [r for r in (config.mtrx_bot.mtrx_room_id, config.mtrx_bot.mtrx_room_id_priv) if r]
+    if room_id not in allowed:
+        logger.debug(f"Комната {room_id} не в списке разрешённых")
+        return False
+    return True
+
+
+async def resolve_target(room_id: str, sender: str) -> Optional[RoomTarget]:
+    if drop_manager is not None:
+        return await drop_manager.resolve(room_id, sender)
+    if not is_allowed_room(room_id):
+        return None
+    return RoomTarget(kind="general", room_id=room_id)
 
 
 def build_menu_text(filename: str, is_personal: bool = False) -> str:
-     #Формирует меню выбора папки. Показывает только имена папок.
     text = f"Получен файл: {filename}\n\nКуда его сохранить? Ответьте цифрой:\n"
     for key, folder_path in TARGET_FOLDERS.items():
-        clean_path = folder_path.replace("\\", "/").rstrip("/")
-        display_name = clean_path.split("/")[-1]
+        display_name = folder_path.replace("\\", "/").rstrip("/").split("/")[-1]
         text += f"{key}. {display_name}\n"
-
     if is_personal:
         text += "*. Личная папка (сохранить в ваш персональный Dropbox)\n"
-
     text += "\nИли отправьте !cancel для отмены."
     return text
 
 
-def is_smb_path(path: str) -> bool:
-    return path.startswith("smb:/") or path.startswith("smb://")
+async def deny_unless_admin(room_id: str, sender: str) -> bool:
+    if is_admin(sender):
+        return False
+    await send_message(room_id, "У вас нет прав для выполнения этой команды.")
+    logger.warning(f"Попытка выполнить админ-команду не-админом: {sender}")
+    return True
 
 
+def _write_bytes(path: str, data: bytes):
+    with open(path, "wb") as f:
+        f.write(data)
 
-# Хэндлеры
+
+# ---------------------------------------------------------------- приём файлов
 
 async def handle_file_event(room: MatrixRoom, event):
-     #Обработчик входящих файлов и изображений. ВСЕГДА показывает меню.
-    if is_event_too_old(event):
-        logger.debug(f"Игнорирую старое событие файла от {event.sender}")
-        return
-
-    if event.sender == client.user_id:
-        return
-
-    # Проверяем, не ожидает ли пользователь отправки файлов админа
-    if await state.is_awaiting_folders(room.room_id, event.sender):
-        logger.debug(f"Файл от {event.sender} пропущен (состояние awaiting_folders)")
-        return
-
-    if await state.is_awaiting_drop_users(room.room_id, event.sender):
-        logger.debug(f"Файл от {event.sender} пропущен (состояние awaiting_drop_users)")
-        return
-
+    """Скачивает файл, кладёт в очередь и показывает меню."""
+    target = await resolve_target(room.room_id, event.sender)
     logger.info(
-        f"Получено событие файла: room={room.room_id}, "
-        f"sender={event.sender}, type={type(event).__name__}"
+        f"Файл от {event.sender} в {room.room_id}: "
+        f"target={target.kind if target else None}"
     )
-
-    # Определение типа комнаты
-    target = None
-    if drop_manager is not None:
-        target = await drop_manager.resolve(room.room_id, event.sender)
-        if target is None:
-            logger.debug(f"Комната {room.room_id} не распознана, игнорируем.")
-            return
-    else:
-        if not is_allowed_room(room.room_id):
-            return
-        target = RoomTarget(kind="general", room_id=room.room_id)
+    if target is None or target.kind not in ("general", "drop"):
+        logger.warning(
+            f"Файл от {event.sender} в {room.room_id} проигнорирован: комната не распознана "
+            f"(для личной комнаты проверьте !drop_status и drop_users.json)"
+        )
+        return
 
     content = event.source.get("content", {})
-    mimetype = content.get("info", {}).get("mimetype", "")
-
+    info = content.get("info", {}) or {}
+    mimetype = info.get("mimetype", "")
     if mimetype not in ALLOWED_MIMETYPES:
-        logger.warning(f"Файл отклонён (неподдерживаемый тип): {mimetype}")
-        await send_message(room.room_id, f"Формат {mimetype} не поддерживается.")
+        logger.warning(f"Файл отклонён (тип): {mimetype!r}")
+        await send_message(room.room_id, f"Формат {mimetype or 'неизвестный'} не поддерживается.")
         return
 
-    filename = content.get("body", "unknown_file")
+    size = info.get("size")
+    if isinstance(size, int) and size > MAX_FILE_BYTES:
+        await send_message(room.room_id, f"Файл слишком большой (максимум {config.dropbox.max_file_mb} МБ).")
+        return
+
     mxc_url = content.get("url")
     if not mxc_url:
         logger.warning("Файл без URL, пропускаю")
         return
 
+    filename = sanitize_filename(content.get("body", "unknown_file"))
     logger.info(f"Файл принят в работу: {filename} от {event.sender}")
 
-    # Скачиваем файл
-    try:
-        response = await client.download(mxc_url)
-    except Exception as e:
-        logger.error(f"Ошибка скачивания {mxc_url}: {e}")
+    body = await download_media(mxc_url)
+    if body is None:
         await send_message(room.room_id, "Ошибка при скачивании файла с сервера.")
         return
-
-    if isinstance(response, nio.DownloadError):
-        logger.error(f"DownloadError: {response.message}")
-        await send_message(room.room_id, "Ошибка при скачивании файла с сервера.")
+    if len(body) > MAX_FILE_BYTES:
+        await send_message(room.room_id, f"Файл слишком большой (максимум {config.dropbox.max_file_mb} МБ).")
         return
 
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    safe_name = "".join(c for c in filename if c.isalnum() or c in "._- ")[:80]
-    temp_path = os.path.join(DOWNLOAD_DIR, f"{event.event_id}_{safe_name}")
-
+    id_hash = hashlib.sha1(event.event_id.encode()).hexdigest()[:16]
+    temp_path = os.path.join(DOWNLOAD_DIR, f"{id_hash}_{filename}")
     try:
-        with open(temp_path, "wb") as f:
-            f.write(response.body)
-        logger.info(f"Файл сохранён во временную папку: {temp_path}")
+        await asyncio.to_thread(_write_bytes, temp_path, body)
     except OSError as e:
         logger.error(f"Ошибка записи временного файла {temp_path}: {e}")
         await send_message(room.room_id, "Ошибка при сохранении файла на диск.")
         return
 
-    # Добавляем файл в очередь
-    await state.add_file_to_queue(room.room_id, event.sender, event.event_id, temp_path, filename)
+    position = await state.add_file_to_queue(room.room_id, event.sender, event.event_id, temp_path, filename)
+    if position > 1:
+        position = await state.get_queue_length(room.room_id, event.sender)  # учитываем просроченные записи
 
-    # Проверяем, сколько файлов в очереди
-    queue_length = await state.get_queue_length(room.room_id, event.sender)
-
-    if queue_length == 1:
-        # Первый файл — показываем меню (с пунктом "*" если это личная комната)
-        is_personal = (target.kind == "drop")
-        await send_message(room.room_id, build_menu_text(filename, is_personal=is_personal))
+    if position == 1:
+        logger.info(f"Показываю меню папок для {filename} ({event.sender}, kind={target.kind})")
+        await send_message(room.room_id, build_menu_text(filename, is_personal=(target.kind == "drop")))
     else:
         await send_message(
             room.room_id,
-            f"Файл {filename} добавлен в очередь. В очереди: {queue_length} файл(ов). "
+            f"Файл {filename} добавлен в очередь. В очереди: {position} файл(ов). "
             f"Сначала обработайте предыдущие файлы.",
         )
 
 
-async def on_room_message(room: MatrixRoom, event):
-     #Обработчик текстовых сообщений
-    global TARGET_FOLDERS
-    global folders_cache
-
-    if is_event_too_old(event):
-        return
-
-    if event.sender == client.user_id:
-        return
-
-    # Определяем тип комнаты
-    target = None
-    if drop_manager is not None:
-        target = await drop_manager.resolve(room.room_id, event.sender)
-        if target is None:
-            return
-    else:
-        if not is_allowed_room(room.room_id):
-            return
-        target = RoomTarget(kind="general", room_id=room.room_id)
-
-    if not isinstance(event, RoomMessageText):
-        return
-
-    text = event.body.strip()
-    logger.debug(f"Текстовое сообщение от {event.sender}: {text}")
-
-
-    # КОМАНДЫ
-
-
-    # !drop - получить или создать персональную комнату
-    if text.lower() == "!drop" and drop_manager is not None:
-        room_id, error = await drop_manager.get_or_create(event.sender)
-        if error:
-            await send_message(room.room_id, error)
-            return
-        await drop_manager._rename_room(room_id, event.sender)
-        link = f"https://matrix.to/#/{room_id}"
-        await send_message(
-            room.room_id,
-            f"Создана персональная комната и отправлено приглашение.\n\n"
-            f"Чтобы войти, откройте раздел **'Приглашения' (Invites)** в вашем клиенте Matrix и нажмите 'Принять'.\n"
-            f"Прямая ссылка на комнату: {link}\n"
-            f"После принятия приглашения просто отправляйте файлы в эту комнату."
-        )
-        return
-
-    # !drop_status - состояние привязки
-    if text.lower() == "!drop_status" and drop_manager is not None:
-        room_id = await drop_manager.room_of(event.sender)
-        if room_id:
-            await send_message(room.room_id, f"Персональная комната привязана: https://matrix.to/#/{room_id}")
-        else:
-            await send_message(room.room_id, "Персональная комната ещё не создана. Отправьте !drop.")
-        return
-
-    # !drop_users - управление списком пользователей (только для админов)
-    if text.lower() == "!drop_users" and drop_manager is not None:
-        if not is_admin(event.sender):
-            await send_message(room.room_id, "У вас нет прав для выполнения этой команды.")
-            return
-        if not os.path.exists(config.dropbox.users_file):
-            await send_message(room.room_id, "Файл drop_users.json не найден.")
-            return
-        try:
-            with open(config.dropbox.users_file, "rb") as f:
-                content = f.read()
-            success = await send_file(
-                room.room_id,
-                "drop_users.json",
-                content,
-                "application/json",
-            )
-            if success:
-                await state.set_awaiting_drop_users(room.room_id, event.sender)
-                await send_message(
-                    room.room_id,
-                    "Отправлен файл drop_users.json с текущим списком пользователей и их личных папок. "
-                    "Отредактируйте его и отправьте обратно. "
-                    "Поддерживаются форматы: JSON и TSV (user_id\\tpath). "
-                    "Для отмены отправьте !cancel.",
-                )
-                logger.info(f"Файл drop_users.json отправлен админу {event.sender}")
-        except OSError as e:
-            logger.error(f"Ошибка чтения drop_users.json: {e}")
-            await send_message(room.room_id, "Ошибка при чтении файла.")
-        return
-
-    # !list - управление списком общих папок (только для админов)
-    if text.lower() == "!list":
-        if not is_admin(event.sender):
-            await send_message(room.room_id, "У вас нет прав для выполнения этой команды.")
-            logger.warning(f"Попытка выполнения !list не-админом: {event.sender}")
-            return
-        folders_content = json.dumps(TARGET_FOLDERS, indent=2, ensure_ascii=False)
-        success = await send_file(
-            room.room_id,
-            "folders.json",
-            folders_content.encode("utf-8"),
-            "application/json",
-        )
-        if success:
-            await state.set_awaiting_folders(room.room_id, event.sender)
-            await send_message(
-                room.room_id,
-                "Отправлен файл folders.json с текущим списком папок. "
-                "Отредактируйте его и отправьте обратно. "
-                "Формат: {\"1\": \"smb://server/share/path\", \"2\": \"/local/path\"}. "
-                "Для отмены отправьте !cancel.",
-            )
-            logger.info(f"Файл folders.json отправлен админу {event.sender}")
-        return
-
-    # !drop_create @user:domain - админ создаёт комнату для другого пользователя
-    if text.lower().startswith("!drop_create ") and drop_manager is not None:
-        if not is_admin(event.sender):
-            await send_message(room.room_id, "У вас нет прав для выполнения этой команды.")
-            return
-        parts = text.split(maxsplit=1)
-        if len(parts) < 2:
-            await send_message(room.room_id, "Шаблон для использования: `!drop_create @user:domain`")
-            return
-        target_user = parts[1].strip()
-
-        if target_user not in drop_manager.users:
-            await send_message(
-                room.room_id,
-                f"Пользователь `{target_user}` не найден в списке. Сначала добавьте его через !drop_users."
-            )
-            return
-
-        room_id, error = await drop_manager.get_or_create(target_user)
-        if error:
-            await send_message(room.room_id, f"Ошибка: {error}")
-        else:
-            await drop_manager._rename_room(room_id, target_user)
-            await send_message(room.room_id, f"Комната для {target_user} готова: https://matrix.to/#/{room_id}")
-        return
-
-    # !drop_reset @user:domain - снять привязку
-    if text.lower().startswith("!drop_reset ") and drop_manager is not None:
-        if not is_admin(event.sender):
-            await send_message(room.room_id, "У вас нет прав для выполнения этой команды.")
-            return
-        parts = text.split(maxsplit=1)
-        if len(parts) < 2:
-            await send_message(room.room_id, "Шаблон для использования: `!drop_reset @user:domain`")
-            return
-        target_user = parts[1].strip()
-        old = await drop_manager.unbind(target_user)
-        if old:
-            await send_message(room.room_id, f"✅ Привязка для {target_user} снята.")
-        else:
-            await send_message(room.room_id, f"ℹ️ Привязка для {target_user} не найдена.")
-        return
-
-    # !drop_reload - перечитать whitelist
-    if text.lower() == "!drop_reload" and drop_manager is not None:
-        if not is_admin(event.sender):
-            await send_message(room.room_id, "У вас нет прав для выполнения этой команды.")
-            return
-        drop_manager.users = load_drop_users(config.dropbox.users_file)
-        await send_message(room.room_id, f"Whitelist обновлён. Пользователей: {len(drop_manager.users)}")
-        return
-
-    # !reload - принудительная перезагрузка folders.json
-    if text.lower() == "!reload":
-        if not is_admin(event.sender):
-            await send_message(room.room_id, "У вас нет прав для выполнения этой команды.")
-            return
-        new_folders = load_folders(config.folders_file)
-        if new_folders is None:
-            await send_message(room.room_id, "Ошибка чтения файла folders.json.")
-            return
-        TARGET_FOLDERS = new_folders
-        await folders_cache.save(new_folders)
-        await send_message(
-            room.room_id,
-            f"Список папок перезагружен из файла. Папок: {len(new_folders)}.",
-        )
-        logger.info(f"Список папок принудительно перезагружен админом {event.sender}")
-        return
-
-    # !cancel - отмена операции
-    if text.lower() == "!cancel":
-        deleted_count = await state.clear_queue(room.room_id, event.sender)
-        if deleted_count > 0:
-            await send_message(
-                room.room_id,
-                f"Операция отменена. Удалено файлов из **вашей** очереди: {deleted_count}."
-            )
-            logger.info(f"Операция отменена пользователем {event.sender}, удалено {deleted_count} файлов")
-        else:
-            await send_message(
-                room.room_id,
-                "У вас нет активных операций для отмены."
-            )
-        return
-
-
-    # ОБРАБОТКА ВЫБОРА ПАПКИ
-
-    file_data = await state.get_next_file(room.room_id, event.sender)
-    if not file_data:
-        return  # Очередь пуста
-
-    choice = text.strip()
-    folder_path = None
-
-    # Проверяем выбор личной папки (символ *)
-    if choice == "*" and target is not None and target.kind == "drop":
-        folder_path = target.folder
-    elif choice in TARGET_FOLDERS:
-        folder_path = TARGET_FOLDERS[choice]
-    else:
-        queue_length = await state.get_queue_length(room.room_id, event.sender)
-        await send_message(
-            room.room_id,
-            f"Неверный выбор. Пожалуйста, ответьте цифрой из списка или '*' (для личной папки). "
-            f"В очереди: {queue_length} файл(ов). Или отправьте !cancel."
-        )
-        return
-
-    src_path = file_data["temp_path"]
-    final_filename = file_data["filename"]
-
-    if is_smb_path(folder_path):
-        # Загрузка по smb
-        try:
-            server, share, rel_path = _parse_smb_path(folder_path)
-        except ValueError as e:
-            logger.error(f"Ошибка парсинга пути {folder_path}: {e}")
-            await send_message(room.room_id, "⚠️ Ошибка: папка настроена некорректно. Сообщите администратору.")
-            return
-
-        remote_full_path = f"{rel_path}/{final_filename}" if rel_path else final_filename
-        success = await smb_client.upload_file(server, share, remote_full_path, src_path)
-
-        if success:
-            try:
-                os.remove(src_path)
-            except OSError:
-                pass
-            # Удаляем файл из очереди
-            await state.remove_file_from_queue(room.room_id, event.sender)
-            clean_smb_path = f"{server}/{share}/{remote_full_path}".replace("//", "/")
-            await send_message(
-                room.room_id,
-                f"Файл `{final_filename}` успешно загружен по адресу\n`{clean_smb_path}`",
-            )
-            logger.info(f"Файл загружен по адресу: {remote_full_path}")
-
-            # Проверяем, есть ли ещё файлы в очереди
-            next_file = await state.get_next_file(room.room_id, event.sender)
-            if next_file:
-                is_personal = (target is not None and target.kind == "drop")
-                await send_message(
-                    room.room_id,
-                    f"Следующий файл в очереди: {next_file['filename']}. "
-                    f"Выберите папку или отправьте !cancel.",
-                )
-                await send_message(room.room_id, build_menu_text(next_file["filename"], is_personal=is_personal))
-        else:
-            await send_message(room.room_id, "Ошибка загрузки файла на smb-шару.")
-            return
-    else:
-        # Локальное сохранение
-        os.makedirs(folder_path, exist_ok=True)
-        dst_path = os.path.join(folder_path, final_filename)
-
-        if os.path.exists(dst_path):
-            name, ext = os.path.splitext(final_filename)
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            dst_path = os.path.join(folder_path, f"{name}_{ts}{ext}")
-
-        try:
-            shutil.move(src_path, dst_path)
-            logger.info(f"Файл перемещён: {src_path} -> {dst_path}")
-
-            # Удаляем файл из очереди
-            await state.remove_file_from_queue(room.room_id, event.sender)
-
-            await send_message(
-                room.room_id,
-                f"Файл `{final_filename}` успешно сохранён по адресу:\n`{dst_path}`",
-            )
-
-            # Проверяем, есть ли ещё файлы в очереди
-            next_file = await state.get_next_file(room.room_id, event.sender)
-            if next_file:
-                is_personal = (target is not None and target.kind == "drop")
-                await send_message(
-                    room.room_id,
-                    f"Следующий файл в очереди: {next_file['filename']}. "
-                    f"Выберите папку или отправьте !cancel.",
-                )
-                await send_message(room.room_id, build_menu_text(next_file["filename"], is_personal=is_personal))
-        except OSError as e:
-            logger.error(f"Ошибка перемещения файла: {e}")
-            await send_message(room.room_id, f"Ошибка при сохранении: {e}")
-            return
-
-
 async def handle_folders_file(room: MatrixRoom, event):
-     #Обработчик файла folders.json от админа
+    """Админ вернул отредактированный folders.json."""
     global TARGET_FOLDERS
-    global folders_cache
-
-    if is_event_too_old(event):
-        return
-
-    if not is_admin(event.sender):
-        return
-
-    if not await state.is_awaiting_folders(room.room_id, event.sender):
-        return
 
     content = event.source.get("content", {})
     mxc_url = content.get("url")
     if not mxc_url:
         return
-
-    try:
-        response = await client.download(mxc_url)
-    except Exception as e:
-        logger.error(f"Ошибка скачивания folders.json: {e}")
-        await send_message(room.room_id, "Ошибка при скачивании файла.")
-        return
-
-    if isinstance(response, nio.DownloadError):
-        logger.error(f"DownloadError: {response.message}")
+    body = await download_media(mxc_url)
+    if body is None:
         await send_message(room.room_id, "Ошибка при скачивании файла.")
         return
 
     try:
-        new_folders = json.loads(response.body.decode("utf-8"))
-        if not isinstance(new_folders, dict):
-            raise ValueError("Ожидается объект JSON")
-        for key, value in new_folders.items():
-            if not isinstance(key, str) or not isinstance(value, str):
-                raise ValueError(f"Неверный формат: ключ {key}, значение {value}")
+        new_folders = validate_folders(json.loads(body.decode("utf-8")))
     except (json.JSONDecodeError, ValueError, UnicodeDecodeError) as e:
         logger.error(f"Ошибка парсинга folders.json: {e}")
-        await send_message(room.room_id, f"Ошибка в формате файла: {e}")
+        await send_message(room.room_id, f"Ошибка в формате файла: {e}\nИсправьте и отправьте снова или !cancel.")
+        return
+    if not new_folders:
+        await send_message(room.room_id, "Список папок пуст - не применяю. Исправьте файл или отправьте !cancel.")
         return
 
     try:
-        save_folders(config.folders_file, new_folders)
+        await asyncio.to_thread(save_folders, config.folders_file, new_folders)
         await folders_cache.save(new_folders)
         TARGET_FOLDERS = new_folders
-        logger.info(f"Список папок обновлён и сохранён в кэш: {new_folders}")
+        logger.info(f"Список папок обновлён: {new_folders}")
     except Exception as e:
         logger.error(f"Ошибка сохранения folders: {e}")
         await send_message(room.room_id, f"Ошибка сохранения: {e}")
         return
 
-    # Создание недостающих папок
-    created = []
-    for key, path in new_folders.items():
+    created, failed = [], []
+    for path in new_folders.values():
         if is_smb_path(path):
             try:
                 server, share, rel_path = _parse_smb_path(path)
-                success = await smb_client.ensure_dir(server, share, rel_path)
-                if success:
-                    created.append(f"{server}/{share}/{rel_path}")
             except ValueError as e:
-                logger.error(f"Ошибка парсинга пути {path}: {e}")
-        else:
-            if not os.path.exists(path):
-                try:
-                    os.makedirs(path, exist_ok=True)
-                    created.append(path)
-                    logger.info(f"Создана папка: {path}")
-                except OSError as e:
-                    logger.error(f"Не удалось создать папку {path}: {e}")
+                failed.append(f"{path} ({e})")
+                continue
+            if await smb_client.ensure_dir(server, share, rel_path):
+                created.append(f"{server}/{share}/{rel_path}")
+            else:
+                failed.append(path)
+        elif not os.path.exists(path):
+            try:
+                await asyncio.to_thread(os.makedirs, path, exist_ok=True)
+                created.append(path)
+            except OSError as e:
+                logger.error(f"Не удалось создать папку {path}: {e}")
+                failed.append(path)
 
-    await state.clear_awaiting_folders(room.room_id, event.sender)
-
+    await state.clear_admin_state(room.room_id, event.sender)
     msg = "Список папок обновлён."
     if created:
-        msg += f"\nСозданы папки: {', '.join(created)}"
+        msg += f"\nПроверены/созданы папки: {', '.join(created)}"
+    if failed:
+        msg += f"\nНе удалось создать: {', '.join(failed)}"
     await send_message(room.room_id, msg)
 
 
 async def handle_drop_users_file(room: MatrixRoom, event):
-     #Обработчик файла drop_users.json от админа
-    global drop_manager
-
-    if is_event_too_old(event):
-        return
-
-    if not is_admin(event.sender):
-        return
-
-    if not await state.is_awaiting_drop_users(room.room_id, event.sender):
-        return
-
+    """Админ вернул отредактированный drop_users.json. Сначала валидация, потом атомарная запись."""
     content = event.source.get("content", {})
     mxc_url = content.get("url")
     if not mxc_url:
         return
-
-    try:
-        response = await client.download(mxc_url)
-    except Exception as e:
-        logger.error(f"Ошибка скачивания drop_users.json: {e}")
+    body = await download_media(mxc_url)
+    if body is None:
         await send_message(room.room_id, "Ошибка при скачивании файла.")
         return
 
-    if isinstance(response, nio.DownloadError):
-        logger.error(f"DownloadError: {response.message}")
-        await send_message(room.room_id, "Ошибка при скачивании файла.")
+    try:
+        users = parse_drop_users(body.decode("utf-8"))
+    except UnicodeDecodeError:
+        users = {}
+    if not users:
+        await send_message(
+            room.room_id,
+            "Не удалось разобрать файл или в нём нет ни одного валидного пользователя. "
+            "Текущий список не изменён. Исправьте файл или отправьте !cancel.",
+        )
         return
 
-    # Сохранение файла
     try:
-        with open(config.dropbox.users_file, "wb") as f:
-            f.write(response.body)
-        logger.info(f"Файл drop_users.json сохранён: {config.dropbox.users_file}")
+        await asyncio.to_thread(save_drop_users_atomic, config.dropbox.users_file, body)
     except OSError as e:
         logger.error(f"Ошибка сохранения drop_users.json: {e}")
         await send_message(room.room_id, "Ошибка при сохранении файла.")
         return
 
-    # Перезагрузка whitelist
     if drop_manager is not None:
-        drop_manager.users = load_drop_users(config.dropbox.users_file)
-        await send_message(
-            room.room_id,
-            f"Список пользователей обновлён. Пользователей: {len(drop_manager.users)}."
-        )
-        logger.info(f"Список пользователей обновлён админом {event.sender}. Пользователей: {len(drop_manager.users)}")
+        drop_manager.users = users
+        await send_message(room.room_id, f"Список пользователей обновлён. Пользователей: {len(users)}.")
+        logger.info(f"Список пользователей обновлён админом {event.sender}: {len(users)}")
     else:
-        await send_message(room.room_id, "Персональный дроп отключён.")
+        await send_message(room.room_id, "Файл сохранён, но персональный дроп отключён в конфигурации.")
+    await state.clear_admin_state(room.room_id, event.sender)
 
-    await state.clear_awaiting_drop_users(room.room_id, event.sender)
+
+@safe
+async def on_file_message(room: MatrixRoom, event):
+    """Единая точка входа для файлов: либо ответ админа на !list / !drop_users, либо обычная загрузка."""
+    if is_event_too_old(event) or event.sender == client.user_id:
+        return
+    if not await state.mark_seen(event.event_id):
+        return
+
+    if await state.is_awaiting_folders(room.room_id, event.sender):
+        if is_admin(event.sender):
+            await handle_folders_file(room, event)
+        return
+    if await state.is_awaiting_drop_users(room.room_id, event.sender):
+        if is_admin(event.sender):
+            await handle_drop_users_file(room, event)
+        return
+
+    spawn(handle_file_event(room, event), "handle_file_event")
 
 
-# Фоновые задачи
+_warned_encrypted: set[str] = set()
+
+
+@safe
+async def on_encrypted_event(room: MatrixRoom, event):
+    """Бот не умеет E2EE: сообщения в зашифрованной комнате до него не доходят. Хотя бы пишем это в лог."""
+    if room.room_id in _warned_encrypted:
+        return
+    _warned_encrypted.add(room.room_id)
+    logger.error(
+        f"Комната {room.room_id} ЗАШИФРОВАНА (событие от {event.sender}). "
+        f"Бот не может читать сообщения и файлы в ней. Создайте комнату без шифрования."
+    )
+
+
+# ---------------------------------------------------------------- команды
+
+async def handle_command(room: MatrixRoom, event, text: str) -> bool:
+    """True, если текст был распознанной командой."""
+    global TARGET_FOLDERS
+    cmd = text.lower()
+    sender, rid = event.sender, room.room_id
+    dm = drop_manager
+
+    if cmd == "!drop" and dm is not None:
+        room_id, error, created = await dm.get_or_create(sender)
+        if error:
+            await send_message(rid, error)
+            return True
+        link = f"https://matrix.to/#/{room_id}"
+        if created:
+            await send_message(
+                rid,
+                "Создана персональная комната и отправлено приглашение.\n"
+                "Откройте раздел «Приглашения» (Invites) в клиенте Matrix и нажмите «Принять».\n"
+                f"Прямая ссылка: {link}",
+            )
+        else:
+            await send_message(rid, f"Ваша персональная комната уже существует: {link}")
+        return True
+
+    if cmd == "!drop_status" and dm is not None:
+        room_id = await dm.room_of(sender)
+        if room_id:
+            await send_message(rid, f"Персональная комната привязана: https://matrix.to/#/{room_id}")
+        else:
+            await send_message(rid, "Персональная комната ещё не создана. Отправьте !drop.")
+        return True
+
+    if cmd == "!drop_users" and dm is not None:
+        if await deny_unless_admin(rid, sender):
+            return True
+        if not os.path.exists(config.dropbox.users_file):
+            await send_message(rid, "Файл drop_users.json не найден.")
+            return True
+        try:
+            with open(config.dropbox.users_file, "rb") as f:
+                data = f.read()
+        except OSError as e:
+            logger.error(f"Ошибка чтения drop_users.json: {e}")
+            await send_message(rid, "Ошибка при чтении файла.")
+            return True
+        if await send_file(rid, "drop_users.json", data, "application/json"):
+            await state.set_awaiting_drop_users(rid, sender)
+            await send_message(
+                rid,
+                "Отправлен drop_users.json. Отредактируйте и отправьте обратно. "
+                "Форматы: JSON или TSV (user_id<TAB>путь). Для отмены - !cancel.",
+            )
+        return True
+
+    if cmd == "!list":
+        if await deny_unless_admin(rid, sender):
+            return True
+        data = json.dumps(TARGET_FOLDERS, indent=2, ensure_ascii=False).encode("utf-8")
+        if await send_file(rid, "folders.json", data, "application/json"):
+            await state.set_awaiting_folders(rid, sender)
+            await send_message(
+                rid,
+                "Отправлен folders.json. Отредактируйте и отправьте обратно. "
+                'Формат: {"1": "smb://server/share/path", "2": "/local/path"}. '
+                "Ключ '*' зарезервирован. Для отмены - !cancel.",
+            )
+        return True
+
+    if cmd.startswith("!drop_create") and dm is not None:
+        if await deny_unless_admin(rid, sender):
+            return True
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2:
+            await send_message(rid, "Использование: !drop_create @user:domain")
+            return True
+        target_user = parts[1].strip()
+        if target_user not in dm.users:
+            await send_message(rid, f"Пользователь {target_user} не найден в списке. Сначала добавьте его через !drop_users.")
+            return True
+        room_id, error, _ = await dm.get_or_create(target_user)
+        if error:
+            await send_message(rid, f"Ошибка: {error}")
+        else:
+            await send_message(rid, f"Комната для {target_user} готова: https://matrix.to/#/{room_id}")
+        return True
+
+    if cmd.startswith("!drop_reset") and dm is not None:
+        if await deny_unless_admin(rid, sender):
+            return True
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2:
+            await send_message(rid, "Использование: !drop_reset @user:domain")
+            return True
+        target_user = parts[1].strip()
+        if await dm.unbind(target_user):
+            await send_message(rid, f"Привязка для {target_user} снята.")
+        else:
+            await send_message(rid, f"Привязка для {target_user} не найдена.")
+        return True
+
+    if cmd == "!drop_reload" and dm is not None:
+        if await deny_unless_admin(rid, sender):
+            return True
+        users = load_drop_users(config.dropbox.users_file)
+        if not users:
+            await send_message(rid, "Файл не найден, повреждён или пуст - список не изменён.")
+        else:
+            dm.users = users
+            await send_message(rid, f"Whitelist обновлён. Пользователей: {len(users)}")
+        return True
+
+    if cmd == "!reload":
+        if await deny_unless_admin(rid, sender):
+            return True
+        new_folders = load_folders(config.folders_file)
+        if not new_folders:
+            await send_message(rid, "Файл folders.json не найден, повреждён или пуст - список не изменён.")
+            return True
+        TARGET_FOLDERS = new_folders
+        await folders_cache.save(new_folders)
+        await send_message(rid, f"Список папок перезагружен из файла. Папок: {len(new_folders)}.")
+        logger.info(f"Список папок перезагружен админом {sender}")
+        return True
+
+    if cmd == "!cancel":
+        deleted, had_state = await state.clear_queue(rid, sender)
+        if deleted:
+            await send_message(rid, f"Операция отменена. Удалено файлов из вашей очереди: {deleted}.")
+        elif had_state:
+            await send_message(rid, "Ожидание файла отменено.")
+        else:
+            await send_message(rid, "У вас нет активных операций для отмены.")
+        return True
+
+    return False
+
+
+# ---------------------------------------------------------------- выбор папки
+
+def _save_local(src: str, folder: str, filename: str) -> str:
+    os.makedirs(folder, exist_ok=True)
+    dst = os.path.join(folder, filename)
+    if os.path.exists(dst):
+        name, ext = os.path.splitext(filename)
+        dst = os.path.join(folder, f"{name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}{ext}")
+    shutil.move(src, dst)
+    return dst
+
+
+async def offer_next_file(room_id: str, sender: str, is_personal: bool):
+    next_file = await state.get_next_file(room_id, sender)
+    if next_file:
+        await send_message(
+            room_id,
+            "Следующий файл в очереди.\n\n" + build_menu_text(next_file["filename"], is_personal=is_personal),
+        )
+
+
+async def process_choice(room_id: str, sender: str, choice: str, target: RoomTarget):
+    async with get_lock(room_id, sender):
+        file_data = await state.get_next_file(room_id, sender)
+        if not file_data:
+            return
+
+        is_personal = target.kind == "drop"
+        if choice == "*" and is_personal:
+            folder_path = target.folder
+        elif choice in TARGET_FOLDERS:
+            folder_path = TARGET_FOLDERS[choice]
+        else:
+            queue_length = await state.get_queue_length(room_id, sender)
+            await send_message(
+                room_id,
+                "Неверный выбор. Ответьте цифрой из списка"
+                + (" или '*' (личная папка)" if is_personal else "")
+                + f". В очереди: {queue_length} файл(ов). Или отправьте !cancel.",
+            )
+            return
+
+        src_path = file_data["temp_path"]
+        filename = file_data["filename"]
+
+        if not os.path.exists(src_path):
+            await state.remove_file_from_queue(room_id, sender)
+            await send_message(room_id, f"Временный файл {filename} утерян. Отправьте его заново.")
+            await offer_next_file(room_id, sender, is_personal)
+            return
+
+        if is_smb_path(folder_path):
+            try:
+                server, share, rel_path = _parse_smb_path(folder_path)
+            except ValueError as e:
+                logger.error(f"Ошибка парсинга пути {folder_path}: {e}")
+                await send_message(room_id, "⚠️ Папка настроена некорректно. Сообщите администратору.")
+                return
+            remote = f"{rel_path}/{filename}" if rel_path else filename
+            final_rel = await smb_client.upload_file(server, share, remote, src_path)
+            if not final_rel:
+                await send_message(room_id, "Ошибка загрузки файла на smb-шару. Файл остался в очереди, можно повторить выбор.")
+                return
+            try:
+                os.remove(src_path)
+            except OSError:
+                pass
+            shown = f"{server}/{share}/{final_rel}"
+        else:
+            try:
+                shown = await asyncio.to_thread(_save_local, src_path, folder_path, filename)
+            except OSError as e:
+                logger.error(f"Ошибка сохранения файла: {e}")
+                await send_message(room_id, f"Ошибка при сохранении: {e}")
+                return
+
+        await state.remove_file_from_queue(room_id, sender)
+        logger.info(f"Файл сохранён: {shown}")
+        await send_message(room_id, f"Файл {filename} успешно сохранён:\n{shown}")
+        await offer_next_file(room_id, sender, is_personal)
+
+
+@safe
+async def on_room_message(room: MatrixRoom, event):
+    if is_event_too_old(event) or event.sender == client.user_id:
+        return
+    target = await resolve_target(room.room_id, event.sender)
+    if target is None:
+        return
+    if not await state.mark_seen(event.event_id):
+        return
+
+    text = strip_reply_fallback(event.body)
+    if not text:
+        return
+
+    if await handle_command(room, event, text):
+        return
+
+    # Выбор папки
+    if target.kind not in ("general", "drop"):
+        return
+    if not await state.get_next_file(room.room_id, event.sender):
+        return
+    spawn(process_choice(room.room_id, event.sender, text, target), "process_choice")
+
+
+# ---------------------------------------------------------------- фоновые задачи
 
 async def orphan_cleanup_loop():
     while True:
@@ -1041,58 +1024,44 @@ async def orphan_cleanup_loop():
             await asyncio.sleep(600)
             if not os.path.exists(DOWNLOAD_DIR):
                 continue
-
-            active_paths = set()
+            active = set()
             async for _, data in state.iter_all_files():
-                temp_path = data.get("temp_path")
-                if temp_path:
-                    active_paths.add(temp_path)
-
+                if data.get("temp_path"):
+                    active.add(data["temp_path"])
+            now = time.time()
             for entry in os.scandir(DOWNLOAD_DIR):
-                if entry.is_file() and entry.path not in active_paths:
-                    try:
-                        os.remove(entry.path)
-                        logger.info(f"[cleanup] удалён orphan-файл: {entry.path}")
-                    except OSError as e:
-                        logger.error(f"[cleanup] ошибка удаления {entry.path}: {e}")
+                if not entry.is_file() or entry.path in active:
+                    continue
+                if now - entry.stat().st_mtime < ORPHAN_MIN_AGE_SECONDS:
+                    continue  # возможно, ещё скачивается/ставится в очередь
+                try:
+                    os.remove(entry.path)
+                    logger.info(f"[cleanup] удалён orphan-файл: {entry.path}")
+                except OSError as e:
+                    logger.error(f"[cleanup] ошибка удаления {entry.path}: {e}")
         except asyncio.CancelledError:
             break
         except Exception as e:
             logger.error(f"[cleanup] ошибка: {e}", exc_info=True)
 
 
-async def sync_token_saver():
-    while True:
-        try:
-            await asyncio.sleep(10)
-            token = getattr(client, "sync_token", None)
-            if token:
-                os.makedirs(os.path.dirname(SYNC_TOKEN_FILE) or ".", exist_ok=True)
-                with open(SYNC_TOKEN_FILE, "w") as f:
-                    f.write(token)
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.error(f"Ошибка сохранения sync_token: {e}")
-
-
 async def old_files_cleanup_loop():
-    # Удаляет файлы старше 2 недель ТОЛЬКО в личных папках MATRIX_DROPBOX
+    """Удаляет старые файлы ТОЛЬКО в личных папках MATRIX_DROPBOX."""
     while True:
         try:
             await asyncio.sleep(3600)
             if drop_manager is None or not SMB_AVAILABLE:
                 continue
-
-            for user_id, drop_user in drop_manager.users.items():
+            for user_id, drop_user in list(drop_manager.users.items()):
                 try:
                     server, share, rel_path = _parse_smb_path(drop_user.smb_path)
                 except ValueError as e:
                     logger.error(f"Ошибка парсинга пути {drop_user.smb_path}: {e}")
                     continue
-
-                deleted = await smb_client.delete_old_files(server, share, rel_path, 14)
-                if deleted > 0:
+                if not rel_path.endswith("MATRIX_DROPBOX"):
+                    continue  # страховка: чистим только личные приёмники
+                deleted = await smb_client.delete_old_files(server, share, rel_path, config.dropbox.retention_days)
+                if deleted:
                     logger.info(f"[cleanup] Удалено {deleted} старых файлов из {server}/{share}/{rel_path}")
         except asyncio.CancelledError:
             break
@@ -1100,116 +1069,117 @@ async def old_files_cleanup_loop():
             logger.error(f"Ошибка очистки старых файлов: {e}", exc_info=True)
 
 
+def _inviter_of(room) -> Optional[str]:
+    inviter = getattr(room, "inviter", None)
+    if inviter:
+        return inviter
+    for ev in getattr(room, "invite_state", None) or []:
+        if getattr(ev, "type", None) == "m.room.member" and getattr(ev, "state_key", None) == client.user_id:
+            return getattr(ev, "sender", None)
+    return None
+
+
 async def invite_checker_loop():
-     #Автоматически принимает приглашения в персональные комнаты от пользователей из whitelist.
+    """Принимает приглашения в персональные комнаты от пользователей из whitelist."""
+    ignored: set[str] = set()  # чтобы не спамить логами каждые 5 секунд
     while True:
         try:
             await asyncio.sleep(5)
-            for room_id, room in list(client.invited_rooms.items()):
-                # Если комната уже привязана к кому-то, просто принимаем
-                owner = await drop_manager.owner_of(room_id) if drop_manager else None
-                if owner:
-                    logger.info(f"Принимаю приглашение в известную персональную комнату {room_id}")
-                    await client.join(room_id)
+            if drop_manager is None:
+                continue
+            invited = dict(client.invited_rooms)
+            ignored &= set(invited)
+
+            for room_id, room in invited.items():
+                if room_id in ignored:
                     continue
 
-                # Ищем, кто именно пригласил бота в эту комнату
-                inviter = None
-                if hasattr(room, 'invite_state') and room.invite_state:
-                    for ev in room.invite_state:
-                        if ev.type == "m.room.member" and ev.state_key == client.user_id:
-                            if ev.content.get("membership") == "invite":
-                                inviter = ev.sender
-                                break
+                owner = await drop_manager.owner_of(room_id)
+                inviter = _inviter_of(room)
 
-                # FALLBACK: если inviter None, пробуем найти его среди участников комнаты
-                if inviter is None and hasattr(room, 'users') and room.users:
-                    members = set(room.users.keys())
-                    others = members - {client.user_id}
-                    if len(others) == 1:
-                        potential_inviter = next(iter(others))
-                        if drop_manager is not None and potential_inviter in drop_manager.users:
-                            inviter = potential_inviter
-
-                # Проверяем, есть ли приглашающий в whitelist персонального дропа
-                if drop_manager is not None and inviter and inviter in drop_manager.users:
-                    logger.info(f"Принимаю приглашение в персональную комнату от {inviter}")
+                if owner:
+                    logger.info(f"Принимаю приглашение в известную персональную комнату {room_id}")
                     result = await client.join(room_id)
                     if isinstance(result, nio.JoinError):
-                        logger.error(f"Не удалось принять приглашение в {room_id}: {result.message}")
-                    else:
-                        await drop_manager.bind(inviter, room_id)
-                        await drop_manager._rename_room(room_id, inviter)
-                        logger.info(f"Успешно вступил в комнату {room_id} и привязал к {inviter}")
+                        logger.error(f"Не удалось войти в {room_id}: {result.message}")
+                        ignored.add(room_id)
+                    continue
+
+                if not inviter or inviter not in drop_manager.users:
+                    logger.warning(f"Приглашение в {room_id} от {inviter} проигнорировано (нет в whitelist)")
+                    ignored.add(room_id)
+                    continue
+
+                current = await drop_manager.room_of(inviter)
+                if current and current != room_id and current in client.rooms:
+                    logger.warning(f"{inviter} уже имеет комнату {current}; приглашение в {room_id} проигнорировано")
+                    ignored.add(room_id)
+                    continue
+
+                result = await client.join(room_id)
+                if isinstance(result, nio.JoinError):
+                    logger.error(f"Не удалось принять приглашение в {room_id}: {result.message}")
+                    ignored.add(room_id)
+                    continue
+
+                if current and current != room_id:
+                    await drop_manager.unbind(inviter)  # старая привязка протухла
+                if await drop_manager.bind(inviter, room_id) == room_id:
+                    await drop_manager.rename_room(room_id, inviter)
+                    logger.info(f"Вошёл в {room_id}, привязал к {inviter}")
                 else:
-                    if inviter is None:
-                        logger.debug(f"Не удалось определить пригласившего в {room_id}, игнорируем.")
-                    else:
-                        logger.warning(
-                            f"Приглашение в {room_id} от {inviter} проигнорировано (пользователь не в whitelist)"
-                        )
+                    logger.error(f"Не удалось привязать {room_id} к {inviter}")
         except asyncio.CancelledError:
             break
         except Exception as e:
             logger.error(f"Ошибка проверки приглашений: {e}", exc_info=True)
 
 
-
-# Точка входа
+# ---------------------------------------------------------------- точка входа
 
 async def main():
-    global TARGET_FOLDERS
-    global folders_cache
-    global drop_manager
+    global TARGET_FOLDERS, folders_cache, drop_manager
 
-    # Инициализация кэша папок
     folders_cache = FoldersCache(state.redis)
-
-    # Очистка устаревших ключей Redis
     await state.cleanup_legacy_keys()
 
-    # Приоритет загрузки: Redis → файл
-    TARGET_FOLDERS = await folders_cache.load()
-    if TARGET_FOLDERS is None:
-        logger.info("Кэш Redis пуст, загружаю из файла...")
-        TARGET_FOLDERS = load_folders(config.folders_file)
-        if TARGET_FOLDERS:
-            await folders_cache.save(TARGET_FOLDERS)
-        else:
-            logger.warning("Список папок пуст. Используйте команду !list для настройки.")
+    # Приоритет: Redis -> файл. Пустой кэш считаем отсутствующим.
+    cached = await folders_cache.load()
+    if cached:
+        TARGET_FOLDERS = cached
     else:
-        logger.info(f"Загружено папок из кэша: {len(TARGET_FOLDERS)}")
+        from_file = load_folders(config.folders_file)
+        if from_file is None:
+            logger.error("folders.json повреждён. Папки не загружены, исправьте файл и выполните !reload.")
+            TARGET_FOLDERS = {}
+        else:
+            TARGET_FOLDERS = from_file
+            if from_file:
+                await folders_cache.save(from_file)
+    if not TARGET_FOLDERS:
+        logger.warning("Список папок пуст. Используйте команду !list для настройки.")
 
     if config.dropbox.enabled:
-        drop_users = load_drop_users(config.dropbox.users_file)
-        general_rooms = {
-            rid for rid in [config.mtrx_bot.mtrx_room_id, config.mtrx_bot.mtrx_room_id_priv] if rid
-        }
+        drop_users = load_drop_users(config.dropbox.users_file) or {}
+        general_rooms = {r for r in (config.mtrx_bot.mtrx_room_id, config.mtrx_bot.mtrx_room_id_priv) if r}
         drop_manager = DropRoomManager(
             client,
             state.redis,
             drop_users,
             config.dropbox.bindings_file,
             excluded_rooms=general_rooms,
+            room_name_template=config.dropbox.room_name_template,
+            retention_days=config.dropbox.retention_days,
         )
         await drop_manager.restore()
         logger.info(f"Персональный дроп включён. Пользователей в whitelist: {len(drop_users)}")
 
-    if os.path.exists(SYNC_TOKEN_FILE):
-        try:
-            with open(SYNC_TOKEN_FILE) as f:
-                token = f.read().strip()
-                if token:
-                    client.sync_token = token
-                    logger.info(f"Загружен sync_token: {token[:20]}...")
-        except Exception as e:
-            logger.warning(f"Не удалось загрузить sync_token: {e}")
-
     if config.mtrx_bot.mtrx_token:
-        client.access_token = config.mtrx_bot.mtrx_token
-        client.user_id = config.mtrx_bot.mtrx_user_id
-        client.device_id = config.mtrx_bot.mtrx_dev_id
-
+        client.restore_login(
+            config.mtrx_bot.mtrx_user_id,
+            config.mtrx_bot.mtrx_dev_id,
+            config.mtrx_bot.mtrx_token,
+        )
         try:
             whoami = await client.whoami()
             if isinstance(whoami, nio.ErrorResponse):
@@ -1221,12 +1191,7 @@ async def main():
             return
     else:
         try:
-            login_resp = await client.login(
-                config.mtrx_bot.mtrx_user_id,
-                config.mtrx_bot.user_pass,
-                device_name="FileBot",
-                device_id=config.mtrx_bot.mtrx_dev_id or None,
-            )
+            login_resp = await client.login(config.mtrx_bot.user_pass, device_name="FileBot")
             if isinstance(login_resp, nio.LoginError):
                 logger.error(f"Ошибка входа: {login_resp.message}")
                 return
@@ -1235,19 +1200,21 @@ async def main():
             logger.error(f"Ошибка логина: {e}")
             return
 
-    # Регистрируем callback'и
+    # sync_token намеренно НЕ сохраняем: после рестарта нужен полный первый sync,
+    # чтобы client.rooms содержал все комнаты (на этом строится DropRoomManager).
+    # От повторной обработки старых событий защищают фильтр по возрасту и state.mark_seen().
     client.add_event_callback(on_room_message, RoomMessageText)
-    client.add_event_callback(handle_file_event, RoomMessageFile)
-    client.add_event_callback(handle_file_event, RoomMessageImage)
-    client.add_event_callback(handle_folders_file, RoomMessageFile)
-    client.add_event_callback(handle_drop_users_file, RoomMessageFile)
+    client.add_event_callback(on_file_message, RoomMessageFile)
+    client.add_event_callback(on_file_message, RoomMessageImage)
+    client.add_event_callback(on_encrypted_event, nio.MegolmEvent)
 
     logger.info("Callback'и зарегистрированы. Запускаю sync_forever...")
 
-    cleanup_task = asyncio.create_task(orphan_cleanup_loop())
-    token_saver_task = asyncio.create_task(sync_token_saver())
-    invite_task = asyncio.create_task(invite_checker_loop())
-    old_files_task = asyncio.create_task(old_files_cleanup_loop())
+    tasks = [
+        asyncio.create_task(orphan_cleanup_loop()),
+        asyncio.create_task(invite_checker_loop()),
+        asyncio.create_task(old_files_cleanup_loop()),
+    ]
 
     try:
         await client.sync_forever(timeout=30000, full_state=False)
@@ -1256,23 +1223,9 @@ async def main():
     except Exception as e:
         logger.error(f"Критическая ошибка в sync_forever: {e}", exc_info=True)
     finally:
-        token = getattr(client, "sync_token", None)
-        if token:
-            try:
-                os.makedirs(os.path.dirname(SYNC_TOKEN_FILE) or ".", exist_ok=True)
-                with open(SYNC_TOKEN_FILE, "w") as f:
-                    f.write(token)
-                logger.info("sync_token сохранён")
-            except Exception as e:
-                logger.error(f"Ошибка сохранения sync_token: {e}")
-
-        for task in [cleanup_task, token_saver_task, invite_task, old_files_task]:
+        for task in tasks + list(_background):
             task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
+        await asyncio.gather(*tasks, *list(_background), return_exceptions=True)
         await state.close()
         await client.close()
         logger.info("Бот остановлен, ресурсы освобождены")
