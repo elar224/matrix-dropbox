@@ -160,7 +160,7 @@ ALLOWED_MIMETYPES = ALLOWED_DOCUMENT_MIMETYPES + ALLOWED_IMAGE_MIMETYPES
 
 
 def validate_folders(data) -> dict[str, str]:
-    """Проверяет структуру списка папок. Бросает ValueError при ошибке."""
+     ###Проверяет структуру списка папок. Выдает ValueError при ошибке.
     if not isinstance(data, dict):
         raise ValueError("Ожидается JSON-объект {\"1\": \"путь\", ...}")
     result: dict[str, str] = {}
