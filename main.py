@@ -51,6 +51,7 @@ try:
 except ConfigError as e:
     raise SystemExit(f"Ошибка конфигурации: {e}")
 
+#########################################################################
 DOWNLOAD_DIR = "/app/tmp_downloads"
 STATE_TTL_SECONDS = 3600
 REDIS_PREFIX = "pending"
@@ -67,7 +68,8 @@ _user_locks: dict[tuple[str, str], asyncio.Lock] = {}
 _background: set[asyncio.Task] = set()
 
 
-# ---------------------------------------------------------------- логирование
+####################################################
+#Логирование
 
 def setup_logging() -> logging.Logger:
     logger = logging.getLogger("matrix_bot")
@@ -99,10 +101,11 @@ def setup_logging() -> logging.Logger:
 logger = setup_logging()
 
 
-# ---------------------------------------------------------------- утилиты
+####################################################################
+#Утилиты
 
 def _parse_smb_path(path: str) -> tuple[str, str, str]:
-    """smb:/server/share/rel/path -> (server, share, rel/path)"""
+    ###smb:/server/share/rel/path -> (server, share, rel/path)
     if path.startswith("smb://"):
         path = "smb:/" + path[6:]
     if not path.startswith("smb:/"):
@@ -118,7 +121,7 @@ def is_smb_path(path: str) -> bool:
 
 
 def sanitize_filename(name: str) -> str:
-    """Оставляет только безопасное имя файла (без путей и запрещённых символов)."""
+    ###Оставляет только безопасное имя файла (без путей и запрещённых символов).
     name = (name or "").replace("\\", "/").split("/")[-1]
     name = "".join(c for c in name if c not in '<>:"|?*' and ord(c) >= 32)
     name = name.strip(" .")
@@ -131,7 +134,7 @@ def sanitize_filename(name: str) -> str:
 
 
 def strip_reply_fallback(body: str) -> str:
-    """Убирает цитату ('> ...') из ответа в Element, чтобы выбор цифры работал."""
+    ###Убирает цитату ('> ...') из ответа в Element, чтобы выбор цифры работал.
     lines = body.split("\n")
     i = 0
     while i < len(lines) and lines[i].startswith(">"):
@@ -172,7 +175,8 @@ def safe(handler):
     return wrapper
 
 
-# ---------------------------------------------------------------- кэш папок
+########################
+#Кэш папок
 
 class FoldersCache:
     CACHE_KEY = "bot:folders"
@@ -204,7 +208,8 @@ class FoldersCache:
             return False
 
 
-# ---------------------------------------------------------------- FSM на Redis
+#######################################################################################
+#FSM на Redis
 
 class StateManager:
     def __init__(self):
@@ -220,7 +225,7 @@ class StateManager:
         await self.redis.aclose()
 
     async def cleanup_legacy_keys(self):
-        """Удаляет только ключи старого формата (decode_responses=True -> type() возвращает str)."""
+        ###удаляет только ключи старого формата (decode_responses=True -> type() возвращает str).
         try:
             keys_to_delete = []
             async for key in self.redis.scan_iter(match=f"{REDIS_PREFIX}:*"):
@@ -245,11 +250,11 @@ class StateManager:
         return f"{REDIS_PREFIX}:file:{event_id}"
 
     async def mark_seen(self, event_id: str) -> bool:
-        """True, если событие видим впервые (защита от повторной обработки после рестарта)."""
+        #True, если событие видим впервые (защита от повторной обработки после рестарта).
         return bool(await self.redis.set(f"{REDIS_PREFIX}:seen:{event_id}", "1", nx=True, ex=300))
 
     async def add_file_to_queue(self, room_id, user_id, event_id, temp_path, filename) -> int:
-        """Возвращает позицию файла в очереди (атомарно, из RPUSH)."""
+        #Возвращает позицию файла в очереди (атомарно, из RPUSH).
         file_data = {
             "event_id": event_id,
             "temp_path": temp_path,
@@ -281,7 +286,7 @@ class StateManager:
         return json.loads(raw) if raw else None
 
     async def get_queue_length(self, room_id, user_id) -> int:
-        """Считает только живые записи, мёртвые убирает."""
+        #cчитает только живые записи, мёртвые убирает.
         queue_key = self._queue_key(room_id, user_id)
         alive = 0
         for event_id in await self.redis.lrange(queue_key, 0, -1):
@@ -292,7 +297,7 @@ class StateManager:
         return alive
 
     async def clear_queue(self, room_id, user_id) -> tuple[int, bool]:
-        """Возвращает (удалено файлов, было ли состояние ожидания админа)."""
+        ##Возвращает (удалено файлов, было ли состояние ожидания админа)
         queue_key = self._queue_key(room_id, user_id)
         deleted = 0
         for event_id in await self.redis.lrange(queue_key, 0, -1):
@@ -349,7 +354,8 @@ class StateManager:
                 yield key, json.loads(raw)
 
 
-# ---------------------------------------------------------------- SMB
+###################################################
+#smb
 
 class SMBClient:
     def __init__(self):
@@ -407,7 +413,7 @@ class SMBClient:
         return True
 
     async def upload_file(self, server: str, share: str, relative_path: str, local_path: str) -> Optional[str]:
-        """Возвращает итоговый относительный путь (с учётом переименования при коллизии) или None."""
+        ###возвращает итоговый относительный путь (с учётом переименования при коллизии) или None.
         if not await self.register_server(server):
             return None
         rel_dir, _, name = relative_path.rpartition("/")
@@ -472,7 +478,8 @@ client = AsyncClient(
 state = StateManager()
 
 
-# ---------------------------------------------------------------- Matrix helpers
+#№№№№№№№№№№№№№№№№№№№№№№№№№№№№№№№№№№№№№№№№№№№№№№№№№№№№№№№№№№№
+# Matrix helpers
 
 def is_admin(user_id: str) -> bool:
     return user_id in config.mtrx_bot.admin_users
@@ -564,10 +571,11 @@ def _write_bytes(path: str, data: bytes):
         f.write(data)
 
 
-# ---------------------------------------------------------------- приём файлов
+###########################################
+# приём файлов
 
 async def handle_file_event(room: MatrixRoom, event):
-    """Скачивает файл, кладёт в очередь и показывает меню."""
+    ##cкачивает файл, кладёт в очередь и показывает меню
     target = await resolve_target(room.room_id, event.sender)
     logger.info(
         f"Файл от {event.sender} в {room.room_id}: "
@@ -635,7 +643,7 @@ async def handle_file_event(room: MatrixRoom, event):
 
 
 async def handle_folders_file(room: MatrixRoom, event):
-    """Админ вернул отредактированный folders.json."""
+    ###Админ вернул отредактированный folders.json
     global TARGET_FOLDERS
 
     content = event.source.get("content", {})
@@ -697,7 +705,7 @@ async def handle_folders_file(room: MatrixRoom, event):
 
 
 async def handle_drop_users_file(room: MatrixRoom, event):
-    """Админ вернул отредактированный drop_users.json. Сначала валидация, потом атомарная запись."""
+    ###Админ вернул отредактированный drop_users.json. Сначала валидация, потом атомарная запись
     content = event.source.get("content", {})
     mxc_url = content.get("url")
     if not mxc_url:
@@ -737,7 +745,7 @@ async def handle_drop_users_file(room: MatrixRoom, event):
 
 @safe
 async def on_file_message(room: MatrixRoom, event):
-    """Единая точка входа для файлов: либо ответ админа на !list / !drop_users, либо обычная загрузка."""
+    ###Единая точка входа для файлов: либо ответ админа на !list / !drop_users, либо обычная загрузка
     if is_event_too_old(event) or event.sender == client.user_id:
         return
     if not await state.mark_seen(event.event_id):
@@ -760,7 +768,7 @@ _warned_encrypted: set[str] = set()
 
 @safe
 async def on_encrypted_event(room: MatrixRoom, event):
-    """Бот не умеет E2EE: сообщения в зашифрованной комнате до него не доходят. Хотя бы пишем это в лог."""
+    ###Бот не умеет E2EE: сообщения в зашифрованной комнате до него не доходят. Хотя бы пишем это в лог
     if room.room_id in _warned_encrypted:
         return
     _warned_encrypted.add(room.room_id)
@@ -770,10 +778,12 @@ async def on_encrypted_event(room: MatrixRoom, event):
     )
 
 
-# ---------------------------------------------------------------- команды
+##############################################################
+# команды
 
 async def handle_command(room: MatrixRoom, event, text: str) -> bool:
-    """True, если текст был распознанной командой."""
+    ###True, если текст был распознанной командой
+
     global TARGET_FOLDERS
     cmd = text.lower()
     sender, rid = event.sender, room.room_id
@@ -909,7 +919,8 @@ async def handle_command(room: MatrixRoom, event, text: str) -> bool:
     return False
 
 
-# ---------------------------------------------------------------- выбор папки
+##############################################################
+# выбор папки
 
 def _save_local(src: str, folder: str, filename: str) -> str:
     os.makedirs(folder, exist_ok=True)
@@ -1016,7 +1027,8 @@ async def on_room_message(room: MatrixRoom, event):
     spawn(process_choice(room.room_id, event.sender, text, target), "process_choice")
 
 
-# ---------------------------------------------------------------- фоновые задачи
+##############################################################
+# фоновые задачи
 
 async def orphan_cleanup_loop():
     while True:
@@ -1046,7 +1058,7 @@ async def orphan_cleanup_loop():
 
 
 async def old_files_cleanup_loop():
-    """Удаляет старые файлы ТОЛЬКО в личных папках MATRIX_DROPBOX."""
+    ###Удаляет старые файлы ТОЛЬКО в личных папках MATRIX_DROPBOX
     while True:
         try:
             await asyncio.sleep(3600)
@@ -1080,7 +1092,7 @@ def _inviter_of(room) -> Optional[str]:
 
 
 async def invite_checker_loop():
-    """Принимает приглашения в персональные комнаты от пользователей из whitelist."""
+    ###Принимает приглашения в персональные комнаты от пользователей из whitelist
     ignored: set[str] = set()  # чтобы не спамить логами каждые 5 секунд
     while True:
         try:
@@ -1135,7 +1147,8 @@ async def invite_checker_loop():
             logger.error(f"Ошибка проверки приглашений: {e}", exc_info=True)
 
 
-# ---------------------------------------------------------------- точка входа
+##############################################################
+# точка входа
 
 async def main():
     global TARGET_FOLDERS, folders_cache, drop_manager
